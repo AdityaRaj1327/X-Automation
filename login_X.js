@@ -4,6 +4,9 @@ const mongoose = require('mongoose');
 const axios = require('axios');
 const proxyChain = require('proxy-chain');
 const { setTimeout: sleep } = require('timers/promises');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 
 // ==================== CONFIGURATION ====================
 const CONFIG = {
@@ -26,8 +29,59 @@ const CONFIG = {
   openrouter: {
     apiKey: process.env.OPENROUTER_API_KEY,
     apiUrl: 'https://openrouter.ai/api/v1/chat/completions'
-  }
+  },
+  activityCsvPath: process.env.ACTIVITY_CSV_PATH || path.resolve(process.cwd(), 'activity_log.csv')
 };
+
+// ==================== CSV TRACKING HELPERS ====================
+// CSV header fields: timestamp,scroll_count,like_count,post_link,comment_post_link,comment_text,number_of_comments,session_id
+function ensureCsvHeader() {
+  const header = 'timestamp,scroll_count,like_count,post_link,comment_post_link,comment_text,number_of_comments,session_id\n';
+  try {
+    if (!fs.existsSync(CONFIG.activityCsvPath)) {
+      fs.writeFileSync(CONFIG.activityCsvPath, header, { encoding: 'utf8' });
+      console.log(`✅ Created CSV tracking file: ${CONFIG.activityCsvPath}`);
+    }
+  } catch (err) {
+    console.error('❌ Could not create CSV tracking file:', err.message);
+  }
+}
+
+function escapeCsvCell(value) {
+  if (value === null || value === undefined) return '';
+  const s = String(value);
+  // escape quotes by doubling them, and wrap in quotes if contains comma/newline/quote
+  const needsWrap = /[",\n]/.test(s);
+  const escaped = s.replace(/"/g, '""');
+  return needsWrap ? `"${escaped}"` : escaped;
+}
+
+/**
+ * Appends an entry to the CSV file. entry is an object with keys matching header.
+ * This function is synchronous to reduce collision risk in single-process script.
+ */
+function appendCsvEntry(entry) {
+  try {
+    const row = [
+      escapeCsvCell(entry.timestamp),
+      escapeCsvCell(entry.scroll_count),
+      escapeCsvCell(entry.like_count),
+      escapeCsvCell(entry.post_link),
+      escapeCsvCell(entry.comment_post_link),
+      escapeCsvCell(entry.comment_text),
+      escapeCsvCell(entry.number_of_comments),
+      escapeCsvCell(entry.session_id)
+    ].join(',') + '\n';
+
+    fs.appendFileSync(CONFIG.activityCsvPath, row, { encoding: 'utf8' });
+  } catch (err) {
+    console.error('❌ Failed to append CSV entry:', err.message);
+  }
+}
+
+// Create session id for this run
+const SESSION_ID = (typeof crypto.randomUUID === 'function') ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
+ensureCsvHeader();
 
 // ==================== VALIDATION ====================
 function validateConfig() {
@@ -50,6 +104,8 @@ function validateConfig() {
   
   console.log('✅ All environment variables loaded successfully');
   console.log(`   Proxy: ${CONFIG.proxy.enabled ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`   Activity CSV: ${CONFIG.activityCsvPath}`);
+  console.log(`   Session ID: ${SESSION_ID}`);
 }
 
 // ==================== MONGODB SCHEMA ====================
@@ -549,6 +605,30 @@ async function extractPostText(page, tweetElement) {
   }
 }
 
+/**
+ * Helper to find the canonical post link (status URL) for a tweet element.
+ * Returns null if not found.
+ */
+async function getTweetLinkFromElement(tweetElement) {
+  try {
+    const hrefHandle = await tweetElement.evaluateHandle(el => {
+      // Find an anchor with /status/ in href inside this tweet element
+      const anchor = el.querySelector('a[href*="/status/"]');
+      if (anchor) return anchor.href;
+      // try searching deeper for anchors (some layouts)
+      const anchors = el.querySelectorAll('a');
+      for (const a of anchors) {
+        if (a.href && a.href.includes('/status/')) return a.href;
+      }
+      return null;
+    });
+    const href = await hrefHandle.jsonValue();
+    return href || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function generateAIComment(postText) {
   try {
     if (!CONFIG.openrouter.apiKey) {
@@ -625,6 +705,9 @@ async function commentOnPost(page, tweetElement) {
     }
     
     console.log(`   💬 Generated comment: "${comment.substring(0, 50)}..."`);
+    
+    // Get post link for logging (attempt before clicking, in case modal changes DOM)
+    const postLink = await getTweetLinkFromElement(tweetElement);
     
     // Scroll button into view
     await replyButton.evaluate(el => el.scrollIntoView({ behavior: 'smooth', block: 'center' }));
@@ -752,7 +835,7 @@ async function commentOnPost(page, tweetElement) {
       console.log('   ⚠️  Could not click home button, continuing...');
     }
     
-    return { success: true, comment };
+    return { success: true, comment, postLink };
   } catch (error) {
     // Try to close reply modal if open
     try {
@@ -1083,6 +1166,11 @@ async function checkAndReplyToNotifications(page) {
   }
 }
 
+/**
+ * Updated likeRandomPosts: returns also the post links that were liked so we can log them.
+ * Return format:
+ *  { liked: <number>, total: <number>, available: <number>, likedPostLinks: [<href>, ...] }
+ */
 async function likeRandomPosts(page, likePercentage = 20) {
   try {
     // Get all like buttons and filter visible ones
@@ -1092,7 +1180,7 @@ async function likeRandomPosts(page, likePercentage = 20) {
       const totalTweets = await page.evaluate(() => {
         return document.querySelectorAll('[data-testid="tweet"]').length;
       });
-      return { liked: 0, total: totalTweets, available: 0 };
+      return { liked: 0, total: totalTweets, available: 0, likedPostLinks: [] };
     }
     
     // Filter to only visible buttons
@@ -1118,7 +1206,7 @@ async function likeRandomPosts(page, likePercentage = 20) {
       const totalTweets = await page.evaluate(() => {
         return document.querySelectorAll('[data-testid="tweet"]').length;
       });
-      return { liked: 0, total: totalTweets, available: 0 };
+      return { liked: 0, total: totalTweets, available: 0, likedPostLinks: [] };
     }
     
     // Get total tweet count
@@ -1127,25 +1215,21 @@ async function likeRandomPosts(page, likePercentage = 20) {
     });
     
     // Calculate how many posts to like (percentage of available unliked posts, max 1 per call for human-like behavior)
-    // More human-like: with 10 tweets, like 1 sometimes (not always)
     const calculatedLikes = Math.floor(visibleButtons.length * (likePercentage / 100));
     
-    // If calculated is 0 but we have buttons, give a small chance to like 1 (very human-like)
     let postsToLike = 0;
     if (calculatedLikes === 0 && visibleButtons.length > 0) {
-      // Small chance (20%) to like 1 post even if percentage calculation is 0
       if (Math.random() < 0.2) {
         postsToLike = 1;
       }
     } else if (calculatedLikes > 0) {
-      // If calculated > 0, randomly decide if we should like (60% chance for more human-like behavior)
       if (Math.random() < 0.6) {
         postsToLike = Math.min(calculatedLikes, 1); // Max 1 per call
       }
     }
     
     if (postsToLike === 0) {
-      return { liked: 0, total: totalTweets, available: visibleButtons.length };
+      return { liked: 0, total: totalTweets, available: visibleButtons.length, likedPostLinks: [] };
     }
     
     // Randomly select posts to like
@@ -1159,10 +1243,31 @@ async function likeRandomPosts(page, likePercentage = 20) {
     }
     
     let likedCount = 0;
+    const likedPostLinks = [];
     
     // Like the selected posts
     for (const button of selectedButtons) {
       try {
+        // Find tweet ancestor and get post link
+        const tweetElementHandle = await button.evaluateHandle(el => el.closest('[data-testid="tweet"]') || null);
+        let postLink = null;
+        if (tweetElementHandle) {
+          try {
+            const link = await tweetElementHandle.evaluate(el => {
+              const a = el.querySelector('a[href*="/status/"]');
+              if (a) return a.href;
+              const anchors = el.querySelectorAll('a');
+              for (const an of anchors) {
+                if (an.href && an.href.includes('/status/')) return an.href;
+              }
+              return null;
+            });
+            postLink = link || null;
+          } catch (e) {
+            postLink = null;
+          }
+        }
+
         // Scroll the button into view smoothly
         await button.evaluate(el => el.scrollIntoView({ behavior: 'smooth', block: 'center' }));
         await sleep(300 + Math.random() * 400); // Random delay between 300-700ms
@@ -1179,6 +1284,7 @@ async function likeRandomPosts(page, likePercentage = 20) {
           // Click the like button
           await button.click();
           likedCount++;
+          if (postLink) likedPostLinks.push(postLink);
           
           // Random delay between likes (800-1500ms for faster continuous operation)
           await sleep(800 + Math.random() * 700);
@@ -1189,10 +1295,10 @@ async function likeRandomPosts(page, likePercentage = 20) {
       }
     }
     
-    return { liked: likedCount, total: totalTweets, available: visibleButtons.length };
+    return { liked: likedCount, total: totalTweets, available: visibleButtons.length, likedPostLinks };
   } catch (error) {
     // Silently return on error to not interrupt scrolling
-    return { liked: 0, total: 0, available: 0, error: error.message };
+    return { liked: 0, total: 0, available: 0, likedPostLinks: [], error: error.message };
   }
 }
 
@@ -1550,6 +1656,19 @@ async function automateTwitter() {
           if (result.liked > 0) {
             totalLiked += result.liked;
             console.log(`   ❤️  Liked ${result.liked} posts (Total liked: ${totalLiked}, ${result.available} unliked available, ${result.total} total tweets)`);
+            // Log each liked post to CSV
+            for (const postLink of result.likedPostLinks) {
+              appendCsvEntry({
+                timestamp: new Date().toISOString(),
+                scroll_count: scrollAttempts,
+                like_count: 1,
+                post_link: postLink,
+                comment_post_link: '',
+                comment_text: '',
+                number_of_comments: totalCommented,
+                session_id: SESSION_ID
+              });
+            }
           }
         } catch (error) {
           // Silently continue on error
@@ -1565,6 +1684,17 @@ async function automateTwitter() {
               totalCommented++;
               console.log(`   ✅ Commented successfully! (Total commented: ${totalCommented})`);
               console.log(`   💬 Comment: "${commentResult.comment}"`);
+              // Log comment to CSV
+              appendCsvEntry({
+                timestamp: new Date().toISOString(),
+                scroll_count: scrollAttempts,
+                like_count: 0,
+                post_link: '', // no like link
+                comment_post_link: commentResult.postLink || '',
+                comment_text: commentResult.comment || '',
+                number_of_comments: totalCommented,
+                session_id: SESSION_ID
+              });
             } else {
               console.log(`   ⚠️  Could not comment: ${commentResult.error}`);
             }

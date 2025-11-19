@@ -15,7 +15,8 @@
     "mongoose": "^8.19.3",
     "node-fetch": "^3.3.2",
     "proxy-chain": "^2.5.9",
-    "puppeteer": "^24.30.0"
+    "puppeteer": "^24.30.0",
+    "string-similarity": "^4.0.4"
   },
   "description": ""
 }

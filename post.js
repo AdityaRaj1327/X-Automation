@@ -3,6 +3,9 @@ require('dotenv').config();
 const puppeteer = require('puppeteer');
 const mongoose = require('mongoose');
 const axios = require('axios');
+const stringSimilarity = require('string-similarity');
+const fs = require('fs');
+const path = require('path');
 const { setTimeout: sleep } = require('timers/promises');
 
 // ==================== CONFIGURATION ====================
@@ -17,7 +20,19 @@ const CONFIG = {
   },
   openrouter: {
     apiKey: process.env.OPENROUTER_API_KEY,
-    apiUrl: 'https://openrouter.ai/api/v1/chat/completions'
+    apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
+    model: process.env.AI_MODEL || 'openai/gpt-3.5-turbo'
+  },
+  automation: {
+    scrollPages: parseInt(process.env.SCROLL_PAGES) || 10,
+    maxRetries: 3,
+    similarityThreshold: 0.7,
+    minDelayMs: 2000,
+    maxDelayMs: 5000
+  },
+  csv: {
+    filename: 'twitter_posts.csv',
+    directory: './data'
   }
 };
 
@@ -34,7 +49,104 @@ function validateConfig() {
   console.log('✅ All environment variables loaded successfully');
 }
 
-// ==================== MONGODB SCHEMA ====================
+// ==================== CSV FUNCTIONS ====================
+function ensureDataDirectory() {
+  const dataDir = path.resolve(CONFIG.csv.directory);
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+    console.log(`✅ Created data directory: ${dataDir}`);
+  }
+}
+
+function initializeCSV() {
+  ensureDataDirectory();
+  const csvPath = path.join(CONFIG.csv.directory, CONFIG.csv.filename);
+  
+  // Check if CSV exists, if not create with headers
+  if (!fs.existsSync(csvPath)) {
+    const headers = [
+      'Timestamp',
+      'Date',
+      'Time',
+      'Trending Topic',
+      'Topic Context',
+      'Tweet Volume',
+      'Post Content',
+      'Post Length',
+      'Success',
+      'Retry Count',
+      'Model Used',
+      'Temperature',
+      'Method'
+    ].join(',') + '\n';
+    
+    fs.writeFileSync(csvPath, headers, 'utf8');
+    console.log(`✅ Created CSV file: ${csvPath}`);
+  }
+  
+  return csvPath;
+}
+
+function escapeCSV(value) {
+  if (value === null || value === undefined) return '';
+  const str = String(value);
+  // Escape quotes and wrap in quotes if contains comma, quote, or newline
+  if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function appendToCSV(csvPath, data) {
+  try {
+    const now = new Date();
+    const row = [
+      escapeCSV(now.toISOString()),
+      escapeCSV(now.toLocaleDateString()),
+      escapeCSV(now.toLocaleTimeString()),
+      escapeCSV(data.trendingTopic),
+      escapeCSV(data.trendContext),
+      escapeCSV(data.tweetCount),
+      escapeCSV(data.postContent),
+      escapeCSV(data.postLength),
+      escapeCSV(data.success ? 'Yes' : 'No'),
+      escapeCSV(data.retryCount),
+      escapeCSV(data.model),
+      escapeCSV(data.temperature),
+      escapeCSV(data.method)
+    ].join(',') + '\n';
+    
+    fs.appendFileSync(csvPath, row, 'utf8');
+    console.log(`✅ Appended to CSV: ${csvPath}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Error writing to CSV:', error.message);
+    return false;
+  }
+}
+
+function readCSVStats(csvPath) {
+  try {
+    if (!fs.existsSync(csvPath)) return null;
+    
+    const content = fs.readFileSync(csvPath, 'utf8');
+    const lines = content.split('\n').filter(line => line.trim());
+    
+    if (lines.length <= 1) return { totalPosts: 0, successfulPosts: 0, failedPosts: 0 };
+    
+    const dataLines = lines.slice(1); // Skip header
+    const totalPosts = dataLines.length;
+    const successfulPosts = dataLines.filter(line => line.includes(',Yes,')).length;
+    const failedPosts = totalPosts - successfulPosts;
+    
+    return { totalPosts, successfulPosts, failedPosts };
+  } catch (error) {
+    console.error('❌ Error reading CSV stats:', error.message);
+    return null;
+  }
+}
+
+// ==================== MONGODB SCHEMAS ====================
 const sessionSchema = new mongoose.Schema({
   accountEmail: { type: String, required: true, unique: true },
   cookies: { type: Array, required: true },
@@ -44,7 +156,40 @@ const sessionSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now }
 });
 
+const contentLogSchema = new mongoose.Schema({
+  trendingTopic: String,
+  trendContext: String,
+  tweetCount: String,
+  generatedPost: String,
+  postedAt: { type: Date, default: Date.now },
+  postLength: Number,
+  success: Boolean,
+  retryCount: Number,
+  engagement: {
+    likes: { type: Number, default: 0 },
+    retweets: { type: Number, default: 0 },
+    replies: { type: Number, default: 0 },
+    views: { type: Number, default: 0 }
+  },
+  metadata: {
+    model: String,
+    temperature: Number,
+    scrollPages: Number,
+    method: String
+  }
+});
+
+const errorLogSchema = new mongoose.Schema({
+  errorType: String,
+  errorMessage: String,
+  stackTrace: String,
+  context: Object,
+  timestamp: { type: Date, default: Date.now }
+});
+
 const Session = mongoose.model('Session', sessionSchema);
+const ContentLog = mongoose.model('ContentLog', contentLogSchema);
+const ErrorLog = mongoose.model('ErrorLog', errorLogSchema);
 
 // ==================== DATABASE FUNCTIONS ====================
 async function connectMongoDB() {
@@ -92,27 +237,229 @@ async function saveSessionToDB(email, cookies, localStorage, sessionStorage) {
   }
 }
 
+async function logSuccessfulPost(trendingTopic, trendContext, tweetCount, postContent, retryCount, metadata, csvPath) {
+  try {
+    // Save to MongoDB
+    await ContentLog.create({
+      trendingTopic,
+      trendContext,
+      tweetCount,
+      generatedPost: postContent,
+      postLength: postContent.length,
+      success: true,
+      retryCount,
+      metadata
+    });
+    console.log('✅ Post logged to MongoDB');
+    
+    // Save to CSV
+    const csvData = {
+      trendingTopic,
+      trendContext,
+      tweetCount,
+      postContent,
+      postLength: postContent.length,
+      success: true,
+      retryCount,
+      model: metadata.model,
+      temperature: metadata.temperature,
+      method: metadata.method
+    };
+    
+    appendToCSV(csvPath, csvData);
+    
+  } catch (error) {
+    console.error('❌ Error logging post:', error.message);
+  }
+}
+
+async function logFailedPost(trendingTopic, trendContext, tweetCount, postContent, error, csvPath) {
+  try {
+    // Save to MongoDB
+    await ContentLog.create({
+      trendingTopic,
+      trendContext,
+      tweetCount,
+      generatedPost: postContent,
+      postLength: postContent.length,
+      success: false,
+      retryCount: CONFIG.automation.maxRetries
+    });
+    
+    await ErrorLog.create({
+      errorType: 'POST_FAILED',
+      errorMessage: error.message,
+      stackTrace: error.stack,
+      context: { trendingTopic, postContent }
+    });
+    
+    // Save to CSV
+    const csvData = {
+      trendingTopic,
+      trendContext,
+      tweetCount,
+      postContent,
+      postLength: postContent.length,
+      success: false,
+      retryCount: CONFIG.automation.maxRetries,
+      model: CONFIG.openrouter.model,
+      temperature: 0.85,
+      method: 'failed'
+    };
+    
+    appendToCSV(csvPath, csvData);
+    
+  } catch (err) {
+    console.error('❌ Error logging failure:', err.message);
+  }
+}
+
+async function checkContentDiversity(newPost) {
+  try {
+    const recentPosts = await ContentLog.find({
+      postedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+      success: true
+    }).limit(20);
+    
+    if (recentPosts.length === 0) return true;
+    
+    for (const post of recentPosts) {
+      const similarity = stringSimilarity.compareTwoStrings(
+        post.generatedPost.toLowerCase(),
+        newPost.toLowerCase()
+      );
+      
+      if (similarity > CONFIG.automation.similarityThreshold) {
+        console.log(`⚠️  Post too similar to recent post (${(similarity * 100).toFixed(1)}% match)`);
+        console.log(`   Recent: "${post.generatedPost.substring(0, 50)}..."`);
+        return false;
+      }
+    }
+    
+    console.log('✅ Post is sufficiently unique');
+    return true;
+  } catch (error) {
+    console.error('❌ Error checking diversity:', error.message);
+    return true;
+  }
+}
+
+// ==================== UTILITY FUNCTIONS ====================
+async function humanDelay(min = CONFIG.automation.minDelayMs, max = CONFIG.automation.maxDelayMs) {
+  const delay = Math.floor(Math.random() * (max - min + 1) + min);
+  await sleep(delay);
+}
+
+function getOptimalPostingTime() {
+  const now = new Date();
+  const hour = now.getHours();
+  const day = now.getDay();
+  
+  const optimalHours = [9, 10, 11, 12, 13, 17, 18];
+  const isWeekday = day >= 1 && day <= 5;
+  
+  const isOptimal = isWeekday && optimalHours.includes(hour);
+  
+  if (!isOptimal) {
+    console.log(`⚠️  Current time (${now.toLocaleTimeString()}) may not be optimal for engagement`);
+    console.log(`   Best times: Weekdays 9-11 AM, 12-1 PM, 5-6 PM`);
+  } else {
+    console.log(`✅ Posting at optimal time: ${now.toLocaleTimeString()}`);
+  }
+  
+  return isOptimal;
+}
+
+async function randomMouseMovement(page) {
+  try {
+    const x = Math.floor(Math.random() * 800) + 100;
+    const y = Math.floor(Math.random() * 600) + 100;
+    await page.mouse.move(x, y, { steps: 10 });
+  } catch (error) {
+    // Ignore errors
+  }
+}
+
+function selectRandomTrend(trends, usedTopics = []) {
+  const availableTrends = trends.filter(trend => 
+    !usedTopics.includes(trend.topic.toLowerCase())
+  );
+  
+  if (availableTrends.length === 0) {
+    console.log('  🔄 All topics used, resetting selection pool');
+    const randomIndex = Math.floor(Math.random() * trends.length);
+    return trends[randomIndex];
+  }
+  
+  const randomIndex = Math.floor(Math.random() * availableTrends.length);
+  const selectedTrend = availableTrends[randomIndex];
+  
+  console.log(`  🎲 Randomly selected trend ${randomIndex + 1} from ${availableTrends.length} available`);
+  return selectedTrend;
+}
+
 // ==================== BROWSER FUNCTIONS ====================
 async function launchBrowser() {
   try {
-    console.log('🔄 Launching browser...');
+    console.log('🔄 Launching browser with anti-detection measures...');
     const browser = await puppeteer.launch({
       headless: false,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-blink-features=AutomationControlled',
-        '--window-size=1920,1080'
-      ]
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-web-security',
+        '--window-size=1920,1080',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu'
+      ],
+      ignoreDefaultArgs: ['--enable-automation']
     });
     
     const pages = await browser.pages();
     const page = pages.length > 0 ? pages[0] : await browser.newPage();
     
     await page.setViewport({ width: 1920, height: 1080 });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     
-    console.log('✅ Browser launched successfully');
+    const userAgents = [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+    ];
+    
+    const randomUA = userAgents[Math.floor(Math.random() * userAgents.length)];
+    await page.setUserAgent(randomUA);
+    
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined
+      });
+      
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5]
+      });
+      
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en']
+      });
+      
+      window.chrome = {
+        runtime: {}
+      };
+      
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+    });
+    
+    console.log('✅ Browser launched with stealth mode');
     return { browser, page };
   } catch (error) {
     console.error('❌ Error launching browser:', error.message);
@@ -128,7 +475,7 @@ async function applySessionCookies(page, sessionData) {
       waitUntil: 'domcontentloaded',
       timeout: 30000
     });
-    await sleep(1000);
+    await humanDelay(1000, 2000);
     
     const cleanCookies = sessionData.cookies
       .filter(cookie => cookie.name && cookie.value && cookie.domain)
@@ -171,7 +518,7 @@ async function validateSession(page) {
       waitUntil: 'networkidle2',
       timeout: 30000
     });
-    await sleep(3000);
+    await humanDelay(3000, 5000);
     
     const isLoggedIn = await page.evaluate(() => {
       return !window.location.href.includes('/login');
@@ -192,7 +539,7 @@ async function validateSession(page) {
 
 async function extractAndSaveSession(page, email) {
   try {
-    await sleep(3000);
+    await humanDelay(3000, 5000);
     const rawCookies = await page.cookies();
     
     const cleanCookies = rawCookies
@@ -238,7 +585,8 @@ async function loginToTwitter(page) {
       waitUntil: 'networkidle2',
       timeout: 60000
     });
-    await sleep(3000);
+    await humanDelay(3000, 5000);
+    await randomMouseMovement(page);
     
     console.log('  📝 Entering email...');
     await page.waitForSelector('input[autocomplete="username"]', {
@@ -246,17 +594,19 @@ async function loginToTwitter(page) {
       timeout: 15000
     });
     await page.click('input[autocomplete="username"]');
-    await sleep(500);
-    await page.type('input[autocomplete="username"]', CONFIG.twitter.email, {
-      delay: 100
-    });
-    await sleep(1500);
+    await humanDelay(500, 1000);
+    
+    for (const char of CONFIG.twitter.email) {
+      await page.keyboard.type(char, {
+        delay: 80 + Math.random() * 120
+      });
+    }
+    await humanDelay(1500, 2500);
     
     console.log('  ⌨️  Pressing Enter...');
     await page.keyboard.press('Enter');
-    await sleep(4000);
+    await humanDelay(4000, 6000);
     
-    // Handle username verification if required
     try {
       const pageText = await page.evaluate(() => document.body.innerText);
       if (pageText.includes('Enter your phone number') ||
@@ -268,14 +618,17 @@ async function loginToTwitter(page) {
           timeout: 5000
         });
         await page.click('input[autocomplete="on"]');
-        await sleep(500);
-        await page.type('input[autocomplete="on"]', CONFIG.twitter.username, {
-          delay: 100
-        });
-        await sleep(1500);
+        await humanDelay(500, 1000);
+        
+        for (const char of CONFIG.twitter.username) {
+          await page.keyboard.type(char, {
+            delay: 80 + Math.random() * 120
+          });
+        }
+        await humanDelay(1500, 2500);
         console.log('  ⌨️  Pressing Enter...');
         await page.keyboard.press('Enter');
-        await sleep(4000);
+        await humanDelay(4000, 6000);
       }
     } catch (error) {
       console.log('  ℹ️  No verification needed');
@@ -287,15 +640,18 @@ async function loginToTwitter(page) {
       timeout: 15000
     });
     await page.click('input[autocomplete="current-password"]');
-    await sleep(500);
-    await page.type('input[autocomplete="current-password"]', CONFIG.twitter.password, {
-      delay: 100
-    });
-    await sleep(1500);
+    await humanDelay(500, 1000);
+    
+    for (const char of CONFIG.twitter.password) {
+      await page.keyboard.type(char, {
+        delay: 80 + Math.random() * 120
+      });
+    }
+    await humanDelay(1500, 2500);
     
     console.log('  ⌨️  Pressing Enter to login...');
     await page.keyboard.press('Enter');
-    await sleep(6000);
+    await humanDelay(6000, 8000);
     
     const currentUrl = page.url();
     if (currentUrl.includes('/home') || !currentUrl.includes('/login')) {
@@ -315,80 +671,190 @@ async function loginToTwitter(page) {
 async function autoScrollPages(page, scrollCount = 10) {
   console.log(`🔄 Scrolling ${scrollCount} pages...`);
   for (let i = 0; i < scrollCount; i++) {
+    await randomMouseMovement(page);
     await page.evaluate(() => {
       window.scrollBy(0, window.innerHeight);
     });
     console.log(`  Scroll ${i + 1}/${scrollCount}`);
-    await sleep(2000);
+    await humanDelay(2000, 4000);
   }
   console.log('✅ Scrolling completed');
 }
 
-async function getTrendingTopics(page) {
+async function getTrendingTopicsWithContext(page) {
   try {
-    console.log('🔄 Extracting trending topics...');
+    console.log('🔄 Extracting trending topics with context...');
     
-    // Navigate to explore/trending section
     await page.goto('https://twitter.com/explore/tabs/trending', {
       waitUntil: 'domcontentloaded',
       timeout: 30000
     });
-    await sleep(3000);
+    await humanDelay(3000, 5000);
+    
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(() => window.scrollBy(0, 500));
+      await humanDelay(1000, 2000);
+    }
     
     const trends = await page.evaluate(() => {
       const trendElements = document.querySelectorAll('[data-testid="trend"]');
       const topics = [];
       
       trendElements.forEach(element => {
-        const trendText = element.querySelector('span');
-        if (trendText && trendText.textContent) {
-          const text = trendText.textContent.trim();
-          if (text && !text.startsWith('·') && text.length > 2) {
-            topics.push(text);
+        try {
+          const spans = element.querySelectorAll('span');
+          let trendText = '';
+          let context = '';
+          let tweetCount = '';
+          
+          spans.forEach((span, index) => {
+            const text = span.textContent.trim();
+            
+            if (text.includes('Trending') || text.includes('·')) {
+              context = text;
+              return;
+            }
+            
+            if (text.includes('posts') || text.includes('Tweets') || text.includes('K') || text.includes('M')) {
+              tweetCount = text;
+              return;
+            }
+            
+            if (!trendText && text.length > 2 && !text.startsWith('#')) {
+              trendText = text;
+            } else if (trendText && text.startsWith('#')) {
+              trendText = text;
+            }
+          });
+          
+          if (trendText && trendText.length > 2) {
+            topics.push({
+              topic: trendText,
+              context: context || 'Trending now',
+              tweetCount: tweetCount || 'N/A'
+            });
           }
+        } catch (err) {
+          console.error('Error parsing trend:', err);
         }
       });
       
-      // Remove duplicates
-      return [...new Set(topics)];
+      const uniqueTopics = [];
+      const seenTopics = new Set();
+      
+      topics.forEach(t => {
+        if (!seenTopics.has(t.topic.toLowerCase())) {
+          seenTopics.add(t.topic.toLowerCase());
+          uniqueTopics.push(t);
+        }
+      });
+      
+      return uniqueTopics;
     });
     
-    console.log(`✅ Found ${trends.length} trending topics`);
-    return trends.slice(0, 10); // Return top 10
+    console.log(`✅ Found ${trends.length} trending topics with context`);
+    return trends.slice(0, 15);
   } catch (error) {
     console.error('❌ Error extracting trending topics:', error.message);
     return [];
   }
 }
 
-// ==================== AI POST GENERATION ====================
-async function generatePostWithOpenRouter(apiKey, trendingTopics) {
+async function sampleTrendingTweets(page, trendTopic, sampleSize = 3) {
   try {
-    const topicsText = trendingTopics.length > 0 
-      ? trendingTopics.slice(0, 5).join(', ') 
-      : 'current events and technology';
+    console.log(`  🔍 Sampling tweets for: "${trendTopic}"`);
     
-    const prompt = `Create an engaging Twitter post about these trending topics: ${topicsText}. 
-    The post should be:
-    - Maximum 280 characters
-    - Engaging and conversational
-    - Include relevant perspective or insight
-    - Natural and authentic
-    - No hashtags unless naturally relevant
+    const searchUrl = `https://twitter.com/search?q=${encodeURIComponent(trendTopic)}&src=trend_click&f=live`;
+    await page.goto(searchUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
+    });
+    await humanDelay(3000, 5000);
     
-    Just provide the tweet text, nothing else.`;
+    for (let i = 0; i < 2; i++) {
+      await page.evaluate(() => window.scrollBy(0, 500));
+      await humanDelay(1000, 2000);
+    }
+    
+    const sampleTweets = await page.evaluate((size) => {
+      const tweets = [];
+      const tweetElements = document.querySelectorAll('[data-testid="tweet"]');
+      
+      let count = 0;
+      for (const tweetEl of tweetElements) {
+        if (count >= size) break;
+        
+        try {
+          const tweetText = tweetEl.querySelector('[data-testid="tweetText"]');
+          if (tweetText && tweetText.textContent) {
+            const text = tweetText.textContent.trim();
+            if (text.length > 20) {
+              tweets.push(text);
+              count++;
+            }
+          }
+        } catch (err) {
+          continue;
+        }
+      }
+      
+      return tweets;
+    }, sampleSize);
+    
+    console.log(`  ✅ Sampled ${sampleTweets.length} tweets`);
+    return sampleTweets;
+  } catch (error) {
+    console.error(`  ❌ Error sampling tweets: ${error.message}`);
+    return [];
+  }
+}
+
+// ==================== AI POST GENERATION ====================
+async function generatePostWithOpenRouter(apiKey, selectedTrend, allTrends, sampleTweets = []) {
+  try {
+    const topicsWithContext = allTrends
+      .slice(0, 5)
+      .map((t, i) => `${i + 1}. ${t.topic} (${t.context}) - ${t.tweetCount}`)
+      .join('\n');
+    
+    let sampleContext = '';
+    if (sampleTweets.length > 0) {
+      sampleContext = `\n\nSAMPLE TWEETS FROM THIS TREND:\n${sampleTweets.slice(0, 2).map((t, i) => `${i + 1}. "${t.substring(0, 100)}..."`).join('\n')}`;
+    }
+    
+    const prompt = `You're a social media expert creating an authentic Twitter post.
+
+CURRENT TRENDING TOPICS:
+${topicsWithContext}
+
+SELECTED TOPIC: "${selectedTrend.topic}"${sampleContext}
+
+TASK:
+Create an engaging tweet about: "${selectedTrend.topic}"
+
+REQUIREMENTS:
+- Maximum 280 characters (strict limit)
+- Be conversational, authentic, and insightful
+- Add a unique perspective or observation
+- Match the tone/style of the sample tweets if provided
+- Use 1-2 relevant hashtags ONLY if natural
+- Include a hook to drive engagement (question, bold statement, or insight)
+- Avoid generic commentary
+
+Return ONLY the tweet text, nothing else.`;
     
     console.log('🤖 Generating AI post with OpenRouter...');
-    console.log(`  Using topics: ${topicsText}`);
+    console.log(`  Selected topic: "${selectedTrend.topic}"`);
+    console.log(`  Model: ${CONFIG.openrouter.model}`);
     
     const response = await axios.post(
       CONFIG.openrouter.apiUrl,
       {
-        model: 'openai/gpt-3.5-turbo',
+        model: CONFIG.openrouter.model,
         messages: [
           {
             role: 'system',
-            content: 'You are a social media expert who creates engaging, authentic Twitter posts.'
+            content: 'You are a viral social media strategist who creates engaging, authentic Twitter content that drives conversation.'
           },
           {
             role: 'user',
@@ -396,7 +862,8 @@ async function generatePostWithOpenRouter(apiKey, trendingTopics) {
           }
         ],
         max_tokens: 150,
-        temperature: 0.8
+        temperature: 0.85,
+        top_p: 0.9
       },
       {
         headers: {
@@ -410,15 +877,29 @@ async function generatePostWithOpenRouter(apiKey, trendingTopics) {
     );
     
     if (response.data && response.data.choices && response.data.choices[0]) {
-      const content = response.data.choices[0].message.content.trim();
+      let content = response.data.choices[0].message.content.trim();
+      content = content.replace(/^["']|["']$/g, '');
       const post = content.length > 280 ? content.substring(0, 277) + '...' : content;
-      console.log(`✅ Generated post (${post.length} chars): "${post}"`);
-      return post;
+      
+      console.log(`✅ Generated post (${post.length} chars)`);
+      console.log(`   Preview: "${post.substring(0, 80)}${post.length > 80 ? '...' : ''}"`);
+      
+      return { 
+        post, 
+        topic: selectedTrend.topic, 
+        context: selectedTrend.context,
+        tweetCount: selectedTrend.tweetCount
+      };
     }
     
     throw new Error('Invalid response from OpenRouter');
   } catch (error) {
     console.error('❌ Error generating post:', error.message);
+    
+    if (error.response) {
+      console.error('  API Response:', error.response.data);
+    }
+    
     return null;
   }
 }
@@ -427,9 +908,8 @@ async function generatePostWithOpenRouter(apiKey, trendingTopics) {
 async function verifyTweetPosted(page, tweetContent) {
   try {
     console.log('  🔍 Verifying tweet was posted...');
-    await sleep(2000);
+    await humanDelay(2000, 3000);
     
-    // Check if compose area is cleared
     const textareaCleared = await page.evaluate(() => {
       const textarea = document.querySelector('[data-testid="tweetTextarea_0"]');
       if (!textarea) return true;
@@ -442,12 +922,11 @@ async function verifyTweetPosted(page, tweetContent) {
       return true;
     }
     
-    // Check timeline for the tweet
     await page.goto('https://twitter.com/home', {
       waitUntil: 'networkidle2',
       timeout: 30000
     });
-    await sleep(3000);
+    await humanDelay(3000, 5000);
     
     const tweetFound = await page.evaluate((content) => {
       const tweets = document.querySelectorAll('[data-testid="tweet"]');
@@ -474,21 +953,20 @@ async function verifyTweetPosted(page, tweetContent) {
   }
 }
 
-// ==================== POST TWEET WITH CTRL+ENTER ====================
-async function postTweetWithEnter(page, tweetContent) {
+// ==================== POST TWEET FUNCTION ====================
+async function postTweetWithButton(page, tweetContent) {
   try {
-    console.log('\n🔄 Starting tweet posting process (using Ctrl+Enter)...');
+    console.log('\n🔄 Starting tweet posting process...');
     console.log(`📝 Content: "${tweetContent}"`);
     console.log(`📏 Length: ${tweetContent.length} characters`);
     
-    // Navigate to home
     await page.goto('https://twitter.com/home', {
       waitUntil: 'domcontentloaded',
       timeout: 30000
     });
-    await sleep(2000);
+    await humanDelay(2000, 3000);
+    await randomMouseMovement(page);
     
-    // Step 1: Find and click the tweet compose area
     console.log('  📝 Finding tweet compose area...');
     const textareaSelectors = [
       '[data-testid="tweetTextarea_0"]',
@@ -517,56 +995,109 @@ async function postTweetWithEnter(page, tweetContent) {
       throw new Error('Could not find tweet compose area');
     }
     
-    // Step 2: Click and focus on textarea
-    await textarea.click();
-    await sleep(500);
+    await page.evaluate((selector) => {
+      const el = document.querySelector(selector);
+      if (el) {
+        el.textContent = '';
+        el.innerHTML = '';
+      }
+    }, textareaSelectors[0]);
     
-    // Step 3: Type the tweet content with human-like behavior
+    await textarea.click();
+    await humanDelay(500, 1000);
+    await randomMouseMovement(page);
+    
     console.log('  ⌨️  Typing tweet content...');
     for (const char of tweetContent) {
       await page.keyboard.type(char, { delay: 50 + Math.random() * 100 });
     }
     
     console.log(`  ✅ Typed ${tweetContent.length} characters`);
-    await sleep(1500);
+    await humanDelay(2000, 3000);
     
-    // Step 4: Press Ctrl+Enter to post (Twitter's keyboard shortcut)
-    console.log('  ⌨️  Pressing Ctrl+Enter to post tweet...');
+    console.log('  🖱️  Preparing to click Post button...');
     
-    // Detect OS for correct modifier key
-    const isMac = process.platform === 'darwin';
-    const modifierKey = isMac ? 'Meta' : 'Control';
+    const postButtonSelector = '[data-testid="tweetButtonInline"]';
+    
+    await page.waitForSelector(postButtonSelector, {
+      visible: true,
+      timeout: 10000
+    });
+    console.log('  ✅ Post button found');
+    
+    await page.evaluate((selector) => {
+      const button = document.querySelector(selector);
+      if (button) {
+        button.disabled = false;
+        button.removeAttribute('disabled');
+        button.removeAttribute('aria-disabled');
+      }
+    }, postButtonSelector);
+    
+    console.log('  ✅ Button enabled (forced)');
+    await humanDelay(1000, 1500);
+    
+    await page.evaluate((selector) => {
+      const button = document.querySelector(selector);
+      if (button) {
+        button.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+      }
+    }, postButtonSelector);
+    
+    await humanDelay(800, 1200);
+    console.log('  ✅ Button scrolled into view');
+    
+    let clicked = false;
     
     try {
-      // Method 1: Use Ctrl+Enter (or Cmd+Enter on Mac)
-      await page.keyboard.down(modifierKey);
-      await page.keyboard.press('Enter');
-      await page.keyboard.up(modifierKey);
-      console.log(`  ✅ Pressed ${isMac ? 'Cmd' : 'Ctrl'}+Enter`);
-    } catch (keyError) {
-      console.log('  ⚠️  Keyboard shortcut failed, trying alternative method...');
-      
-      // Method 2: Trigger keyboard event directly in page context
-      await page.evaluate(() => {
-        const textarea = document.querySelector('[data-testid="tweetTextarea_0"]');
-        if (textarea) {
-          const event = new KeyboardEvent('keydown', {
-            key: 'Enter',
-            ctrlKey: true,
-            bubbles: true,
-            cancelable: true
-          });
-          textarea.dispatchEvent(event);
-        }
-      });
-      console.log('  ✅ Triggered event via JavaScript');
+      console.log('  🖱️  Attempting native browser click...');
+      await page.$eval(postButtonSelector, element => element.click());
+      console.log('  ✅ Post button clicked (native click)');
+      clicked = true;
+    } catch (nativeError) {
+      console.log('  ⚠️  Native click failed, trying page.evaluate...');
     }
     
-    // Step 5: Wait for tweet to be posted
-    console.log('  ⏳ Waiting for tweet to post...');
-    await sleep(4000);
+    if (!clicked) {
+      try {
+        await page.evaluate((selector) => {
+          const button = document.querySelector(selector);
+          if (button) {
+            button.click();
+          }
+        }, postButtonSelector);
+        console.log('  ✅ Post button clicked (evaluate click)');
+        clicked = true;
+      } catch (evalError) {
+        console.log('  ⚠️  Evaluate click failed, trying coordinate click...');
+      }
+    }
     
-    // Step 6: Verify tweet was posted
+    if (!clicked) {
+      try {
+        const buttonElement = await page.$(postButtonSelector);
+        if (buttonElement) {
+          const box = await buttonElement.boundingBox();
+          if (box) {
+            const x = box.x + (box.width / 2);
+            const y = box.y + (box.height / 2);
+            await page.mouse.click(x, y, { delay: 100 });
+            console.log('  ✅ Post button clicked (coordinate click)');
+            clicked = true;
+          }
+        }
+      } catch (coordError) {
+        console.log('  ❌ All click methods failed');
+      }
+    }
+    
+    if (!clicked) {
+      throw new Error('Failed to click Post button with all methods');
+    }
+    
+    console.log('  ⏳ Waiting for tweet to post...');
+    await humanDelay(5000, 7000);
+    
     const verified = await verifyTweetPosted(page, tweetContent);
     
     if (verified) {
@@ -580,12 +1111,11 @@ async function postTweetWithEnter(page, tweetContent) {
   } catch (error) {
     console.error('❌ Error posting tweet:', error.message);
     
-    // Take screenshot for debugging
     try {
       const screenshotPath = `tweet-error-${Date.now()}.png`;
       await page.screenshot({ 
         path: screenshotPath,
-        fullPage: false 
+        fullPage: true 
       });
       console.log(`📸 Screenshot saved: ${screenshotPath}`);
     } catch (screenshotError) {
@@ -596,79 +1126,85 @@ async function postTweetWithEnter(page, tweetContent) {
   }
 }
 
-// ==================== ALTERNATIVE: POST WITH BUTTON CLICK (FALLBACK) ====================
-async function postTweetWithButton(page, tweetContent) {
-  try {
-    console.log('\n🔄 Posting tweet with button click (fallback method)...');
+// ==================== POST WITH RETRY LOGIC ====================
+async function postTweetWithRetry(page, postData, csvPath, maxRetries = CONFIG.automation.maxRetries) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    console.log(`\n📤 POSTING ATTEMPT ${attempt}/${maxRetries}`);
+    console.log('─'.repeat(60));
     
-    await page.goto('https://twitter.com/home', {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000
-    });
-    await sleep(2000);
-    
-    // Find textarea
-    const textarea = await page.waitForSelector('[data-testid="tweetTextarea_0"]', {
-      visible: true,
-      timeout: 5000
-    });
-    
-    await textarea.click();
-    await sleep(500);
-    
-    // Type content
-    for (const char of tweetContent) {
-      await page.keyboard.type(char, { delay: 50 + Math.random() * 100 });
+    try {
+      const success = await postTweetWithButton(page, postData.post);
+      
+      if (success) {
+        await logSuccessfulPost(
+          postData.topic,
+          postData.context,
+          postData.tweetCount,
+          postData.post,
+          attempt,
+          {
+            model: CONFIG.openrouter.model,
+            temperature: 0.85,
+            scrollPages: CONFIG.automation.scrollPages,
+            method: 'native_click_forced'
+          },
+          csvPath
+        );
+        return true;
+      }
+      
+      if (attempt < maxRetries) {
+        console.log(`⏳ Waiting before retry...`);
+        await humanDelay(5000, 10000);
+      }
+    } catch (error) {
+      console.error(`❌ Attempt ${attempt} failed:`, error.message);
+      
+      if (attempt === maxRetries) {
+        await logFailedPost(postData.topic, postData.context, postData.tweetCount, postData.post, error, csvPath);
+        return false;
+      }
+      
+      await humanDelay(3000, 6000);
     }
-    await sleep(1500);
-    
-    // Find and click post button
-    const postButton = await page.waitForSelector('[data-testid="tweetButtonInline"]', {
-      visible: true,
-      timeout: 5000
-    });
-    
-    await page.waitForFunction(
-      (selector) => {
-        const button = document.querySelector(selector);
-        return button && !button.disabled;
-      },
-      { timeout: 10000 },
-      '[data-testid="tweetButtonInline"]'
-    );
-    
-    await postButton.click();
-    console.log('  ✅ Clicked post button');
-    
-    await sleep(4000);
-    
-    return await verifyTweetPosted(page, tweetContent);
-    
-  } catch (error) {
-    console.error('❌ Fallback method failed:', error.message);
-    return false;
   }
+  
+  return false;
 }
 
 // ==================== MAIN FUNCTION ====================
 async function main() {
-  console.log('🚀 Twitter Automation with AI Post Generation Starting...\n');
+  console.log('🚀 ENHANCED TWITTER AUTOMATION WITH AI & CSV LOGGING\n');
   console.log('═'.repeat(60));
   
   validateConfig();
+  
+  // Initialize CSV
+  const csvPath = initializeCSV();
+  console.log(`📄 CSV file: ${csvPath}`);
+  
+  // Show CSV stats
+  const stats = readCSVStats(csvPath);
+  if (stats) {
+    console.log(`📊 CSV Stats: ${stats.totalPosts} total posts (${stats.successfulPosts} successful, ${stats.failedPosts} failed)\n`);
+  }
+  
   await connectMongoDB();
   
   let browser, page;
+  const usedTopics = [];
   
   try {
-    // Launch browser
+    console.log('\n⏰ TIMING CHECK');
+    console.log('─'.repeat(60));
+    getOptimalPostingTime();
+    
     console.log('\n📱 STEP 1: BROWSER INITIALIZATION');
     console.log('─'.repeat(60));
     const result = await launchBrowser();
     browser = result.browser;
     page = result.page;
     
-    // Session management
     console.log('\n🔐 STEP 2: AUTHENTICATION');
     console.log('─'.repeat(60));
     const existingSession = await loadSessionFromDB(CONFIG.twitter.email);
@@ -699,78 +1235,129 @@ async function main() {
     
     console.log('✅ Authentication successful!');
     
-    // Navigate to home and scroll
     console.log('\n📜 STEP 3: SCROLLING FEED');
     console.log('─'.repeat(60));
     await page.goto('https://twitter.com/home', {
       waitUntil: 'networkidle2',
       timeout: 30000
     });
-    await sleep(2000);
-    await autoScrollPages(page, 10);
+    await humanDelay(2000, 3000);
+    await autoScrollPages(page, CONFIG.automation.scrollPages);
     
-    // Get trending topics
     console.log('\n📊 STEP 4: EXTRACTING TRENDING TOPICS');
     console.log('─'.repeat(60));
-    const trendingTopics = await getTrendingTopics(page);
+    const trendingTopics = await getTrendingTopicsWithContext(page);
     
     if (trendingTopics.length === 0) {
-      console.log('⚠️  No trending topics found, using generic prompt');
-    } else {
-      console.log(`✅ Trending Topics (${trendingTopics.length} found):`);
-      trendingTopics.forEach((topic, i) => {
-        console.log(`  ${i + 1}. ${topic}`);
+      throw new Error('No trending topics found');
+    }
+    
+    console.log(`✅ Trending Topics (${trendingTopics.length} found):\n`);
+    trendingTopics.forEach((trend, i) => {
+      console.log(`${i + 1}. ${trend.topic}`);
+      console.log(`   Context: ${trend.context}`);
+      console.log(`   Volume: ${trend.tweetCount}`);
+      console.log();
+    });
+    
+    console.log('🎲 STEP 5: RANDOM TOPIC SELECTION');
+    console.log('─'.repeat(60));
+    const selectedTrend = selectRandomTrend(trendingTopics, usedTopics);
+    usedTopics.push(selectedTrend.topic.toLowerCase());
+    
+    console.log(`✅ Selected: "${selectedTrend.topic}"`);
+    console.log(`   Context: ${selectedTrend.context}`);
+    console.log(`   Volume: ${selectedTrend.tweetCount}\n`);
+    
+    console.log('📝 STEP 6: SAMPLING TRENDING TWEETS');
+    console.log('─'.repeat(60));
+    const sampleTweets = await sampleTrendingTweets(page, selectedTrend.topic, 3);
+    
+    if (sampleTweets.length > 0) {
+      console.log(`\nSample tweets for "${selectedTrend.topic}":`);
+      sampleTweets.forEach((tweet, i) => {
+        console.log(`\n${i + 1}. "${tweet.substring(0, 100)}${tweet.length > 100 ? '...' : ''}"`);
       });
     }
     
-    // Generate post using OpenRouter
-    console.log('\n🤖 STEP 5: GENERATING AI POST');
+    console.log('\n\n🤖 STEP 7: GENERATING AI POST');
     console.log('─'.repeat(60));
-    const postContent = await generatePostWithOpenRouter(
+    const postData = await generatePostWithOpenRouter(
       CONFIG.openrouter.apiKey,
-      trendingTopics
+      selectedTrend,
+      trendingTopics,
+      sampleTweets
     );
     
-    if (!postContent) {
+    if (!postData) {
       throw new Error('Could not generate post content');
     }
     
     console.log('\n📝 Generated Post:');
     console.log('┌' + '─'.repeat(58) + '┐');
-    console.log(`│ ${postContent.padEnd(56)} │`);
+    const lines = postData.post.match(/.{1,56}/g) || [postData.post];
+    lines.forEach(line => {
+      console.log(`│ ${line.padEnd(56)} │`);
+    });
     console.log('└' + '─'.repeat(58) + '┘');
-    console.log(`Length: ${postContent.length}/280 characters`);
+    console.log(`Length: ${postData.post.length}/280 characters`);
+    console.log(`Topic: ${postData.topic}`);
     
-    // Post the tweet using Ctrl+Enter
-    console.log('\n📤 STEP 6: POSTING TWEET');
+    console.log('\n🔍 STEP 8: CONTENT DIVERSITY CHECK');
     console.log('─'.repeat(60));
-    let posted = await postTweetWithEnter(page, postContent);
+    const isDiverse = await checkContentDiversity(postData.post);
     
-    // If Ctrl+Enter failed, try button click as fallback
-    if (!posted) {
-      console.log('\n⚠️  Ctrl+Enter method failed, trying button click...');
-      posted = await postTweetWithButton(page, postContent);
+    if (!isDiverse) {
+      console.log('⚠️  Generated post is too similar to recent posts');
+      console.log('   Regenerating with different trend...');
+      
+      const newTrend = selectRandomTrend(trendingTopics, usedTopics);
+      usedTopics.push(newTrend.topic.toLowerCase());
+      
+      const retryPostData = await generatePostWithOpenRouter(
+        CONFIG.openrouter.apiKey,
+        newTrend,
+        trendingTopics,
+        []
+      );
+      
+      if (retryPostData) {
+        Object.assign(postData, retryPostData);
+        console.log(`✅ New post generated: "${postData.post.substring(0, 60)}..."`);
+      }
     }
     
-    // Final summary
+    console.log('\n📤 STEP 9: POSTING TWEET');
+    console.log('═'.repeat(60));
+    const posted = await postTweetWithRetry(page, postData, csvPath);
+    
     console.log('\n' + '═'.repeat(60));
     if (posted) {
       console.log('🎉 AUTOMATION COMPLETED SUCCESSFULLY!');
       console.log('═'.repeat(60));
-      console.log('✅ Scrolled 10 pages');
+      console.log(`✅ Scrolled ${CONFIG.automation.scrollPages} pages`);
       console.log(`✅ Found ${trendingTopics.length} trending topics`);
+      console.log(`✅ Randomly selected: "${selectedTrend.topic}"`);
+      console.log(`✅ Sampled ${sampleTweets.length} tweets for context`);
       console.log('✅ Generated AI-powered tweet');
-      console.log('✅ Posted tweet using Ctrl+Enter shortcut');
+      console.log('✅ Posted tweet successfully');
+      console.log(`✅ Logged to MongoDB & CSV`);
+      console.log(`\n📊 Post Details:`);
+      console.log(`   Topic: ${postData.topic}`);
+      console.log(`   Length: ${postData.post.length} chars`);
+      console.log(`   Model: ${CONFIG.openrouter.model}`);
+      console.log(`   CSV: ${csvPath}`);
     } else {
       console.log('⚠️  AUTOMATION COMPLETED WITH WARNINGS');
       console.log('═'.repeat(60));
-      console.log('✅ Scrolled 10 pages');
+      console.log(`✅ Scrolled ${CONFIG.automation.scrollPages} pages`);
       console.log(`✅ Found ${trendingTopics.length} trending topics`);
       console.log('✅ Generated AI-powered tweet');
-      console.log('⚠️  Tweet posting failed');
+      console.log('⚠️  Tweet posting failed after all retries');
+      console.log(`   Error logged to CSV: ${csvPath}`);
     }
     
-    console.log('\n⏳ Keeping browser open for 30 seconds...');
+    console.log('\n⏳ Keeping browser open for 30 seconds for verification...');
     await sleep(30000);
     
   } catch (error) {
@@ -778,6 +1365,17 @@ async function main() {
     console.error('═'.repeat(60));
     console.error('Error:', error.message);
     console.error('Stack:', error.stack);
+    
+    try {
+      await ErrorLog.create({
+        errorType: 'CRITICAL_AUTOMATION_ERROR',
+        errorMessage: error.message,
+        stackTrace: error.stack,
+        context: { timestamp: new Date() }
+      });
+    } catch (logError) {
+      console.error('Could not log error to database:', logError.message);
+    }
   } finally {
     if (browser) {
       await browser.close();
@@ -789,5 +1387,4 @@ async function main() {
   }
 }
 
-// Run the automation
 main().catch(console.error);
