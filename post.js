@@ -28,7 +28,8 @@ const CONFIG = {
     maxRetries: 3,
     similarityThreshold: 0.7,
     minDelayMs: 2000,
-    maxDelayMs: 5000
+    maxDelayMs: 5000,
+    postsToDo: parseInt(process.env.POSTS_TO_DO) || 1 // Number of posts to do
   },
   csv: {
     filename: 'twitter_posts.csv',
@@ -919,6 +920,12 @@ async function verifyTweetPosted(page, tweetContent) {
     
     if (textareaCleared) {
       console.log('  ✅ Compose area cleared - tweet posted successfully');
+      // Navigate to home immediately after successful post
+      await page.goto('https://twitter.com/home', {
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      });
+      await humanDelay(2000, 3000);
       return true;
     }
     
@@ -1327,33 +1334,92 @@ async function main() {
       }
     }
     
-    console.log('\n📤 STEP 9: POSTING TWEET');
+    console.log('\n📤 STEP 9: POSTING TWEETS');
     console.log('═'.repeat(60));
-    const posted = await postTweetWithRetry(page, postData, csvPath);
+    console.log(`📝 Posts to do: ${CONFIG.automation.postsToDo}`);
+    
+    let totalPosted = 0;
+    let totalFailed = 0;
+    
+    // Loop to post multiple times
+    for (let postNumber = 1; postNumber <= CONFIG.automation.postsToDo; postNumber++) {
+      console.log(`\n🔄 POST ${postNumber}/${CONFIG.automation.postsToDo}`);
+      console.log('─'.repeat(60));
+      
+      // If not the first post, get a new trend and generate new content
+      if (postNumber > 1) {
+        console.log('\n📊 Getting new trending topic...');
+        const newTrendingTopics = await getTrendingTopicsWithContext(page);
+        if (newTrendingTopics.length > 0) {
+          const newSelectedTrend = selectRandomTrend(newTrendingTopics, usedTopics);
+          usedTopics.push(newSelectedTrend.topic.toLowerCase());
+          
+          console.log(`✅ Selected: "${newSelectedTrend.topic}"`);
+          
+          const newSampleTweets = await sampleTrendingTweets(page, newSelectedTrend.topic, 3);
+          
+          const newPostData = await generatePostWithOpenRouter(
+            CONFIG.openrouter.apiKey,
+            newSelectedTrend,
+            newTrendingTopics,
+            newSampleTweets
+          );
+          
+          if (newPostData) {
+            Object.assign(postData, newPostData);
+            console.log(`✅ Generated new post: "${postData.post.substring(0, 60)}..."`);
+          }
+        }
+        
+        // Navigate to home before posting
+        await page.goto('https://twitter.com/home', {
+          waitUntil: 'networkidle2',
+          timeout: 30000
+        });
+        await humanDelay(2000, 3000);
+      }
+      
+      const posted = await postTweetWithRetry(page, postData, csvPath);
+      
+      if (posted) {
+        totalPosted++;
+        console.log(`✅ Post ${postNumber} completed successfully!`);
+        
+        // Navigate to home after successful post
+        await page.goto('https://twitter.com/home', {
+          waitUntil: 'networkidle2',
+          timeout: 30000
+        });
+        await humanDelay(3000, 5000); // Wait before next post
+        
+        // If not the last post, wait a bit more
+        if (postNumber < CONFIG.automation.postsToDo) {
+          console.log(`⏳ Waiting before next post...`);
+          await humanDelay(5000, 8000);
+        }
+      } else {
+        totalFailed++;
+        console.log(`⚠️  Post ${postNumber} failed`);
+      }
+    }
     
     console.log('\n' + '═'.repeat(60));
-    if (posted) {
-      console.log('🎉 AUTOMATION COMPLETED SUCCESSFULLY!');
+    if (totalPosted > 0) {
+      console.log('🎉 AUTOMATION COMPLETED!');
       console.log('═'.repeat(60));
+      console.log(`✅ Total posts attempted: ${CONFIG.automation.postsToDo}`);
+      console.log(`✅ Successfully posted: ${totalPosted}`);
+      if (totalFailed > 0) {
+        console.log(`⚠️  Failed posts: ${totalFailed}`);
+      }
       console.log(`✅ Scrolled ${CONFIG.automation.scrollPages} pages`);
       console.log(`✅ Found ${trendingTopics.length} trending topics`);
-      console.log(`✅ Randomly selected: "${selectedTrend.topic}"`);
-      console.log(`✅ Sampled ${sampleTweets.length} tweets for context`);
-      console.log('✅ Generated AI-powered tweet');
-      console.log('✅ Posted tweet successfully');
       console.log(`✅ Logged to MongoDB & CSV`);
-      console.log(`\n📊 Post Details:`);
-      console.log(`   Topic: ${postData.topic}`);
-      console.log(`   Length: ${postData.post.length} chars`);
-      console.log(`   Model: ${CONFIG.openrouter.model}`);
       console.log(`   CSV: ${csvPath}`);
     } else {
       console.log('⚠️  AUTOMATION COMPLETED WITH WARNINGS');
       console.log('═'.repeat(60));
-      console.log(`✅ Scrolled ${CONFIG.automation.scrollPages} pages`);
-      console.log(`✅ Found ${trendingTopics.length} trending topics`);
-      console.log('✅ Generated AI-powered tweet');
-      console.log('⚠️  Tweet posting failed after all retries');
+      console.log(`❌ All ${CONFIG.automation.postsToDo} posts failed`);
       console.log(`   Error logged to CSV: ${csvPath}`);
     }
     
