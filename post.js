@@ -905,6 +905,373 @@ Return ONLY the tweet text, nothing else.`;
   }
 }
 
+// ==================== COMMENT FUNCTIONS ====================
+async function getCommentCount(tweetElement) {
+  try {
+    const commentCount = await tweetElement.evaluate((el) => {
+      // Find the reply button
+      const replyButton = el.querySelector('button[data-testid="reply"]');
+      if (!replyButton) return null;
+      
+      // Get aria-label which often contains the count
+      const ariaLabel = replyButton.getAttribute('aria-label') || '';
+      
+      // Extract number from aria-label (e.g., "Reply. 5 replies" or "5 replies")
+      const ariaMatch = ariaLabel.match(/(\d+)\s*repl/i);
+      if (ariaMatch) {
+        const num = parseInt(ariaMatch[1], 10);
+        if (num >= 1 && num <= 9) {
+          return num;
+        }
+        return null; // Skip if not 1-9
+      }
+      
+      // Try to find the count in the button's parent or sibling elements
+      let parent = replyButton.parentElement;
+      let attempts = 0;
+      
+      while (parent && attempts < 3) {
+        const text = parent.textContent || parent.innerText || '';
+        
+        // Look for patterns like "5" or "5 replies" or "Reply 5"
+        const patterns = [
+          /(\d+)\s*repl/i,  // "5 replies"
+          /repl[^\d]*(\d+)/i,  // "Reply 5"
+          /^(\d+)$/  // Just a number
+        ];
+        
+        for (const pattern of patterns) {
+          const match = text.match(pattern);
+          if (match) {
+            const num = parseInt(match[1], 10);
+            if (num >= 1 && num <= 9) {
+              return num;
+            }
+            if (num > 9 || num === 0) {
+              return null; // Skip if 0 or >= 10
+            }
+          }
+        }
+        
+        // Check for spans or divs with numbers near the button
+        const siblings = Array.from(parent.children || []);
+        for (const sibling of siblings) {
+          if (sibling === replyButton) continue;
+          const siblingText = sibling.textContent || sibling.innerText || '';
+          const numMatch = siblingText.match(/^(\d+)$/);
+          if (numMatch) {
+            const num = parseInt(numMatch[1], 10);
+            if (num >= 1 && num <= 9) {
+              return num;
+            }
+            if (num > 9 || num === 0) {
+              return null;
+            }
+          }
+        }
+        
+        parent = parent.parentElement;
+        attempts++;
+      }
+      
+      // If no number found and button exists, likely 0 comments (skip)
+      return null;
+    });
+    
+    return commentCount;
+  } catch (error) {
+    console.error('  ⚠️  Error getting comment count:', error.message);
+    return null;
+  }
+}
+
+async function generateAIComment(postText) {
+  try {
+    if (!CONFIG.openrouter.apiKey) {
+      return null;
+    }
+    
+    const prompt = `You are a friendly Twitter user. Generate a short, natural, engaging comment (max 280 characters) that responds to this tweet. Be authentic and conversational. Do not use hashtags or @mentions unless necessary.
+
+Tweet: "${postText.substring(0, 500)}"
+
+Generate a natural comment:`;
+    
+    const response = await axios.post(
+      CONFIG.openrouter.apiUrl,
+      {
+        model: CONFIG.openrouter.model,
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a friendly Twitter user. Generate a short, natural, engaging comment (max 280 characters) that responds to the tweet. Be authentic and conversational. Do not use hashtags or @mentions unless necessary.'
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        max_tokens: 150,
+        temperature: 0.85,
+        top_p: 0.9
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${CONFIG.openrouter.apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://twitter.com',
+          'X-Title': 'Twitter Automation'
+        },
+        timeout: 15000
+      }
+    );
+    
+    if (response.data && response.data.choices && response.data.choices[0]) {
+      let comment = response.data.choices[0].message.content.trim();
+      comment = comment.replace(/^["']|["']$/g, '');
+      return comment.length > 280 ? comment.substring(0, 277) + '...' : comment;
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('  ❌ Error generating AI comment:', error.message);
+    return null;
+  }
+}
+
+async function extractPostText(page, tweetElement) {
+  try {
+    const text = await tweetElement.evaluate((el) => {
+      const textElement = el.querySelector('[data-testid="tweetText"]') || 
+                         el.querySelector('[lang]') ||
+                         el.querySelector('span[dir="auto"]');
+      
+      if (textElement) {
+        return textElement.innerText || textElement.textContent || '';
+      }
+      
+      return el.innerText || el.textContent || '';
+    });
+    
+    return text.trim();
+  } catch (error) {
+    return '';
+  }
+}
+
+async function getTweetLinkFromElement(tweetElement) {
+  try {
+    const hrefHandle = await tweetElement.evaluateHandle((el) => {
+      // Find an anchor with /status/ in href inside this tweet element
+      const anchor = el.querySelector('a[href*="/status/"]');
+      if (anchor) return anchor.href;
+      // try searching deeper for anchors (some layouts)
+      const anchors = el.querySelectorAll('a');
+      for (const a of anchors) {
+        if (a.href && a.href.includes('/status/')) return a.href;
+      }
+      return null;
+    });
+    const href = await hrefHandle.jsonValue();
+    return href || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function commentOnPost(page, tweetElement) {
+  try {
+    // First check comment count - only proceed if 1-9
+    const commentCount = await getCommentCount(tweetElement);
+    
+    if (commentCount === null || commentCount === 0 || commentCount > 9) {
+      return { 
+        success: false, 
+        error: `Comment count is ${commentCount === null ? 'unknown' : commentCount}, skipping (only commenting on posts with 1-9 comments)` 
+      };
+    }
+    
+    console.log(`  ✅ Post has ${commentCount} comment(s) - proceeding to comment`);
+    
+    // Find the reply/comment button
+    const replyButton = await tweetElement.$('button[data-testid="reply"]');
+    
+    if (!replyButton) {
+      return { success: false, error: 'Reply button not found' };
+    }
+    
+    // Extract post text for AI generation
+    const postText = await extractPostText(page, tweetElement);
+    
+    if (!postText) {
+      return { success: false, error: 'Could not extract post text' };
+    }
+    
+    // Generate AI comment
+    console.log('  🤖 Generating AI comment...');
+    const comment = await generateAIComment(postText);
+    
+    if (!comment) {
+      return { success: false, error: 'Could not generate comment' };
+    }
+    
+    console.log(`  💬 Generated comment: "${comment.substring(0, 50)}..."`);
+    
+    // Get post link for logging (attempt before clicking, in case modal changes DOM)
+    const postLink = await getTweetLinkFromElement(tweetElement);
+    
+    // Scroll button into view
+    await replyButton.evaluate(el => el.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+    await humanDelay(500, 1000);
+    
+    // Click reply button
+    await replyButton.click();
+    await humanDelay(1000, 2000);
+    
+    // Wait for reply textarea to appear
+    let replyTextarea = null;
+    const textareaSelectors = [
+      'div[data-testid="tweetTextarea_0"]',
+      'div[contenteditable="true"][data-testid="tweetTextarea_0"]',
+      'div[role="textbox"][data-testid="tweetTextarea_0"]',
+      'div[contenteditable="true"]',
+      'div[role="textbox"]'
+    ];
+    
+    for (const selector of textareaSelectors) {
+      try {
+        replyTextarea = await page.waitForSelector(selector, { 
+          visible: true, 
+          timeout: 3000 
+        });
+        if (replyTextarea) break;
+      } catch (e) {
+        continue;
+      }
+    }
+    
+    if (!replyTextarea) {
+      await page.keyboard.press('Escape');
+      return { success: false, error: 'Reply textarea not found' };
+    }
+    
+    // Type the comment with human-like delays
+    await replyTextarea.click();
+    await humanDelay(500, 1000);
+    
+    // Clear any existing text first
+    await page.keyboard.down('Control');
+    await page.keyboard.press('a');
+    await page.keyboard.up('Control');
+    await humanDelay(200, 400);
+    
+    // Type character by character
+    for (const char of comment) {
+      await page.keyboard.type(char, { delay: 50 + Math.random() * 100 });
+    }
+    
+    await humanDelay(1000, 2000);
+    
+    // Find and click the reply/tweet button
+    let tweetButton = await page.$('button[data-testid="tweetButton"]');
+    
+    if (!tweetButton) {
+      tweetButton = await page.$('button[data-testid="tweetButtonInline"]');
+    }
+    
+    if (!tweetButton) {
+      await page.keyboard.press('Escape');
+      return { success: false, error: 'Tweet button not found' };
+    }
+    
+    // Check if button is enabled
+    const isEnabled = await tweetButton.evaluate(el => !el.disabled);
+    
+    if (!isEnabled) {
+      await page.keyboard.press('Escape');
+      return { success: false, error: 'Tweet button is disabled' };
+    }
+    
+    // Click to post the comment
+    await tweetButton.click();
+    await humanDelay(2000, 3000);
+    
+    // Verify comment was posted (check if reply modal closed)
+    const modalClosed = await page.evaluate(() => {
+      const modal = document.querySelector('[data-testid="tweetTextarea_0"]');
+      return !modal || modal.offsetParent === null;
+    });
+    
+    if (modalClosed) {
+      console.log('  ✅ Comment posted successfully');
+      return { success: true, comment, commentCount, postLink };
+    } else {
+      // Try to close modal
+      await page.keyboard.press('Escape');
+      return { success: true, comment, commentCount, postLink }; // Assume success even if modal still open
+    }
+    
+  } catch (error) {
+    console.error('  ❌ Error commenting on post:', error.message);
+    try {
+      await page.keyboard.press('Escape');
+    } catch (e) {
+      // Ignore
+    }
+    return { success: false, error: error.message };
+  }
+}
+
+async function findAndCommentOnPosts(page, maxAttempts = 10) {
+  try {
+    console.log('\n💬 STEP: FINDING POSTS TO COMMENT ON');
+    console.log('─'.repeat(60));
+    console.log('  🔍 Looking for posts with 1-9 comments...');
+    
+    // Get all visible tweets
+    const tweets = await page.$$('[data-testid="tweet"]');
+    
+    if (tweets.length === 0) {
+      return { success: false, error: 'No tweets found' };
+    }
+    
+    console.log(`  📊 Found ${tweets.length} tweets, checking comment counts...`);
+    
+    // Filter to only tweets with 1-9 comments
+    const eligibleTweets = [];
+    for (const tweet of tweets) {
+      try {
+        const commentCount = await getCommentCount(tweet);
+        if (commentCount !== null && commentCount >= 1 && commentCount <= 9) {
+          eligibleTweets.push({ tweet, commentCount });
+          console.log(`  ✅ Found eligible post with ${commentCount} comment(s)`);
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+    
+    if (eligibleTweets.length === 0) {
+      console.log('  ⚠️  No posts found with 1-9 comments');
+      return { success: false, error: 'No eligible posts found (need 1-9 comments)' };
+    }
+    
+    console.log(`  ✅ Found ${eligibleTweets.length} eligible post(s) with 1-9 comments`);
+    
+    // Randomly select one tweet
+    const randomIndex = Math.floor(Math.random() * eligibleTweets.length);
+    const selected = eligibleTweets[randomIndex];
+    
+    console.log(`  🎲 Selected post with ${selected.commentCount} comment(s)`);
+    
+    // Comment on the selected tweet
+    return await commentOnPost(page, selected.tweet);
+    
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
 // ==================== POST VERIFICATION ====================
 async function verifyTweetPosted(page, tweetContent) {
   try {
@@ -1401,6 +1768,40 @@ async function main() {
         totalFailed++;
         console.log(`⚠️  Post ${postNumber} failed`);
       }
+    }
+    
+    // Comment on posts with 1-9 comments
+    if (CONFIG.openrouter.apiKey) {
+      console.log('\n💬 STEP 10: COMMENTING ON POSTS');
+      console.log('═'.repeat(60));
+      console.log('  📋 Filter: Only commenting on posts with 1-9 comments');
+      
+      // Navigate to home to see posts
+      await page.goto('https://twitter.com/home', {
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      });
+      await humanDelay(3000, 5000);
+      
+      // Scroll a bit to see more posts
+      for (let i = 0; i < 3; i++) {
+        await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+        await humanDelay(2000, 3000);
+      }
+      
+      const commentResult = await findAndCommentOnPosts(page);
+      
+      if (commentResult.success) {
+        console.log(`\n✅ Successfully commented on a post!`);
+        console.log(`   Comment: "${commentResult.comment?.substring(0, 60)}${commentResult.comment?.length > 60 ? '...' : ''}"`);
+        console.log(`   Post had ${commentResult.commentCount} comment(s)`);
+      } else {
+        console.log(`\n⚠️  Could not comment: ${commentResult.error}`);
+      }
+    } else {
+      console.log('\n💬 STEP 10: COMMENTING ON POSTS');
+      console.log('═'.repeat(60));
+      console.log('  ⚠️  OpenRouter API key not configured - commenting disabled');
     }
     
     console.log('\n' + '═'.repeat(60));

@@ -81,6 +81,15 @@ function Analytics() {
       render: (value) => value || 0
     },
     {
+      header: 'Comment Link',
+      accessor: 'comment_post_link',
+      render: (value) => value ? (
+        <a href={value} target="_blank" rel="noopener noreferrer" className="text-green-500 hover:underline truncate max-w-xs block" title={value}>
+          {value.substring(0, 50)}...
+        </a>
+      ) : '-'
+    },
+    {
       header: 'Comment',
       accessor: 'comment_text',
       render: (value) => value ? (

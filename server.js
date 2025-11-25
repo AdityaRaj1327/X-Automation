@@ -600,6 +600,7 @@ app.get('/api/activity', async (req, res) => {
           scroll_count: parseInt(row.scroll_count || 0),
           like_count: parseInt(row.like_count || 0),
           post_link: row.post_link || '',
+          comment_post_link: row.comment_post_link || '',
           comment_text: row.comment_text || ''
         }))
         .filter(row => row.timestamp) // Filter out empty rows
