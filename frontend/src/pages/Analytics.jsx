@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { RefreshCw, Calendar, TrendingUp, Heart, MessageSquare, FileText } from 'lucide-react'
+import { RefreshCw, Calendar, Heart, MessageSquare, FileText } from 'lucide-react'
 import Card from '../components/Card'
 import Table from '../components/Table'
 import Button from '../components/Button'
@@ -145,21 +145,7 @@ function Analytics() {
       </div>
 
       {/* Stats Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6">
-        <Card className="p-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm font-medium text-gray-600 dark:text-gray-400">Total Scrolls</p>
-              <p className="text-2xl font-bold text-gray-900 dark:text-white mt-2">
-                {stats.totalScrolls.toLocaleString()}
-              </p>
-            </div>
-            <div className="p-3 bg-blue-50 dark:bg-blue-900/20 rounded-lg">
-              <TrendingUp className="h-6 w-6 text-blue-500" />
-            </div>
-          </div>
-        </Card>
-
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <Card className="p-6">
           <div className="flex items-center justify-between">
             <div>

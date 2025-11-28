@@ -19,12 +19,12 @@ const CONFIG = {
     password: process.env.TWITTER_PASSWORD
   },
   proxy: {
-    host: process.env.PROXY_HOST,
-    port: process.env.PROXY_PORT,
-    username: process.env.PROXY_USERNAME,
-    password: process.env.PROXY_PASSWORD,
-    rotateUrl: process.env.PROXY_ROTATE_URL,
-    enabled: process.env.USE_PROXY === 'true'
+    host: process.env.PROXY_HOST || '195.201.248.211',
+    port: process.env.PROXY_PORT || '12765',
+    username: process.env.PROXY_USERNAME || 'digitalguruseven',
+    password: process.env.PROXY_PASSWORD || 'dERmacYAstAR',
+    rotateUrl: process.env.PROXY_ROTATE_URL || 'https://gridpanel.net/api/reboot?token=NDU5NjQsNDc1ZDZkYjUtNWUxMi00OTVjLWIzMzctY2NjMTYyNmNiNjFj',
+    enabled: process.env.USE_PROXY !== 'false' // Default to true unless explicitly set to 'false'
   },
   openrouter: {
     apiKey: process.env.OPENROUTER_API_KEY,
@@ -91,10 +91,6 @@ function validateConfig() {
     'TWITTER_PASSWORD'
   ];
 
-  if (CONFIG.proxy.enabled) {
-    required.push('PROXY_HOST', 'PROXY_PORT', 'PROXY_USERNAME', 'PROXY_PASSWORD');
-  }
-
   const missing = required.filter(key => !process.env[key]);
   
   if (missing.length > 0) {
@@ -102,8 +98,20 @@ function validateConfig() {
     process.exit(1);
   }
   
+  // Validate proxy config if enabled (check that values exist, either from env or defaults)
+  if (CONFIG.proxy.enabled) {
+    if (!CONFIG.proxy.host || !CONFIG.proxy.port || !CONFIG.proxy.username || !CONFIG.proxy.password) {
+      console.error('❌ Proxy is enabled but missing required proxy configuration');
+      console.error('   Please set PROXY_HOST, PROXY_PORT, PROXY_USERNAME, PROXY_PASSWORD');
+      process.exit(1);
+    }
+  }
+  
   console.log('✅ All environment variables loaded successfully');
   console.log(`   Proxy: ${CONFIG.proxy.enabled ? 'ENABLED' : 'DISABLED'}`);
+  if (CONFIG.proxy.enabled) {
+    console.log(`   Proxy Host: ${CONFIG.proxy.host}:${CONFIG.proxy.port}`);
+  }
   console.log(`   Activity CSV: ${CONFIG.activityCsvPath}`);
   console.log(`   Session ID: ${SESSION_ID}`);
 }
@@ -149,20 +157,36 @@ async function loadSessionFromDB(email) {
 
 async function saveSessionToDB(email, cookies, localStorage, sessionStorage) {
   try {
+    // Check if session already exists
+    const existingSession = await Session.findOne({ accountEmail: email });
+    const isNewSession = !existingSession;
+    
     const result = await Session.findOneAndUpdate(
       { accountEmail: email },
       {
+        accountEmail: email,
         cookies,
         localStorage,
         sessionStorage,
-        updatedAt: new Date()
+        updatedAt: new Date(),
+        // Only set createdAt if this is a new session
+        ...(isNewSession ? { createdAt: new Date() } : {})
       },
-      { upsert: true, new: true }
+      { upsert: true, new: true, setDefaultsOnInsert: true }
     );
-    console.log('✅ Session saved to MongoDB');
+    
+    if (isNewSession) {
+      console.log('✅ New session created and saved to MongoDB');
+      console.log(`   Account Email: ${email}`);
+    } else {
+      console.log('✅ Session updated in MongoDB');
+      console.log(`   Account Email: ${email}`);
+    }
     console.log(`   Cookies stored: ${cookies.length}`);
+    console.log(`   Session ID: ${result._id}`);
   } catch (error) {
     console.error('❌ Error saving session:', error.message);
+    console.error('   Stack:', error.stack);
   }
 }
 
@@ -293,23 +317,49 @@ async function testProxyHTTSTunnel() {
       }
     };
     
-    // Test HTTPS specifically (required for Twitter)
-    const response = await axios.get('https://twitter.com', {
-      proxy: proxyConfig,
-      timeout: 15000,
-      maxRedirects: 5,
-      validateStatus: (status) => status >= 200 && status < 400
-    });
-    
-    console.log('✅ Proxy supports HTTPS tunneling');
-    return true;
-  } catch (error) {
-    console.error('❌ Proxy does not support HTTPS tunneling:', error.message);
-    if (error.code === 'ECONNRESET' || error.message.includes('tunnel')) {
-      console.log('   💡 This proxy may not support HTTPS/SSL tunneling');
-      console.log('   💡 Twitter requires HTTPS, so this proxy may not work');
+    // Test HTTPS with a simple site first (more reliable than Twitter)
+    // Accept any status code - even 400/403 means the tunnel works
+    try {
+      const response = await axios.get('https://www.google.com', {
+        proxy: proxyConfig,
+        timeout: 10000,
+        maxRedirects: 3,
+        validateStatus: () => true // Accept any status code
+      });
+      
+      // If we got a response (even error), HTTPS tunneling works
+      console.log('✅ Proxy supports HTTPS tunneling');
+      return true;
+    } catch (testError) {
+      // Check if it's a connection error (tunnel doesn't work) vs HTTP error (tunnel works)
+      if (testError.code === 'ECONNREFUSED' || 
+          testError.code === 'ECONNRESET' || 
+          testError.code === 'ETIMEDOUT' ||
+          testError.message.includes('tunnel') ||
+          testError.message.includes('ENOTFOUND')) {
+        // Real connection error - tunnel doesn't work
+        throw testError;
+      }
+      
+      // HTTP errors (400, 403, etc.) mean the tunnel works, just the site rejected us
+      console.log('✅ Proxy supports HTTPS tunneling (got response, even if error)');
+      return true;
     }
-    return false;
+  } catch (error) {
+    // Only log as failure if it's a real connection error
+    if (error.code === 'ECONNRESET' || 
+        error.code === 'ECONNREFUSED' || 
+        error.code === 'ETIMEDOUT' ||
+        error.message.includes('tunnel') ||
+        error.message.includes('ENOTFOUND')) {
+      console.error('❌ Proxy does not support HTTPS tunneling:', error.message);
+      console.log('   💡 This proxy may not support HTTPS/SSL tunneling');
+      return false;
+    }
+    
+    // Other errors might still mean tunnel works, so allow it
+    console.log('⚠️  HTTPS test inconclusive, but will try with browser anyway');
+    return true;
   }
 }
 
@@ -510,18 +560,38 @@ async function applySessionCookies(page, sessionData) {
 async function validateSession(page) {
   try {
     console.log('🔄 Validating session...');
-    await safeNavigate(page, 'https://twitter.com/home', { 
-      waitUntil: 'networkidle2', 
-      timeout: 30000 
-    });
     
-    await sleep(3000);
+    // First, check if already logged in on current page (before navigating)
+    const currentLoggedIn = await isLoggedIn(page);
+    if (currentLoggedIn) {
+      console.log('✅ Session is valid - Already logged in (current page check)');
+      return true;
+    }
     
-    const isLoggedIn = await page.evaluate(() => {
-      return !window.location.href.includes('/login');
-    });
-
-    if (isLoggedIn) {
+    // Try to navigate to home page with error handling
+    let navigationSuccess = false;
+    try {
+      await safeNavigate(page, 'https://twitter.com/home', {
+        waitUntil: 'domcontentloaded',
+        timeout: 20000
+      });
+      await sleep(2000);
+      navigationSuccess = true;
+    } catch (navError) {
+      // If navigation fails, check if we're already logged in on current page
+      console.log('   ⚠️  Navigation had issues, checking current page status...');
+      const stillLoggedIn = await isLoggedIn(page);
+      if (stillLoggedIn) {
+        console.log('✅ Session is valid - Already logged in (despite navigation error)');
+        return true;
+      }
+      // If navigation failed and we're not logged in, continue to check
+    }
+    
+    // Check login status after navigation attempt (or if navigation was skipped)
+    const isLoggedInStatus = await isLoggedIn(page);
+    
+    if (isLoggedInStatus) {
       console.log('✅ Session is valid - Already logged in');
       return true;
     } else {
@@ -529,6 +599,17 @@ async function validateSession(page) {
       return false;
     }
   } catch (error) {
+    // If error occurs, try one more time to check current page
+    try {
+      const fallbackCheck = await isLoggedIn(page);
+      if (fallbackCheck) {
+        console.log('✅ Session is valid - Already logged in (fallback check)');
+        return true;
+      }
+    } catch (e) {
+      // Ignore fallback errors
+    }
+    
     console.error('❌ Session validation failed:', error.message);
     return false;
   }
@@ -536,9 +617,11 @@ async function validateSession(page) {
 
 async function extractAndSaveSession(page, email) {
   try {
+    console.log('\n💾 Extracting session data for MongoDB storage...');
     await sleep(3000);
     
     const rawCookies = await page.cookies();
+    console.log(`   📦 Found ${rawCookies.length} cookies`);
     
     const cleanCookies = rawCookies
       .filter(cookie => cookie.name && cookie.value && cookie.domain)
@@ -560,6 +643,8 @@ async function extractAndSaveSession(page, email) {
         return cleaned;
       });
     
+    console.log(`   ✅ Cleaned ${cleanCookies.length} valid cookies`);
+    
     const localStorage = await page.evaluate(() => {
       try {
         return JSON.parse(JSON.stringify(window.localStorage));
@@ -576,13 +661,95 @@ async function extractAndSaveSession(page, email) {
       }
     });
 
+    console.log(`   💾 Saving session to MongoDB for account: ${email}...`);
     await saveSessionToDB(email, cleanCookies, localStorage, sessionStorage);
+    console.log('   ✅ Session extraction and save completed successfully\n');
   } catch (error) {
     console.error('❌ Error extracting session:', error.message);
+    console.error('   Stack:', error.stack);
   }
 }
 
 // ==================== POST INTERACTION FUNCTIONS ====================
+async function getCommentCount(tweetElement) {
+  try {
+    const commentCount = await tweetElement.evaluate((el) => {
+      // Find the reply button
+      const replyButton = el.querySelector('button[data-testid="reply"]');
+      if (!replyButton) return null;
+      
+      // Get aria-label which often contains the count
+      const ariaLabel = replyButton.getAttribute('aria-label') || '';
+      
+      // Extract number from aria-label (e.g., "Reply. 5 replies" or "5 replies")
+      const ariaMatch = ariaLabel.match(/(\d+)\s*repl/i);
+      if (ariaMatch) {
+        const num = parseInt(ariaMatch[1], 10);
+        if (num >= 1 && num < 20) {
+          return num;
+        }
+        return null; // Skip if not 1-19
+      }
+      
+      // Try to find the count in the button's parent or sibling elements
+      let parent = replyButton.parentElement;
+      let attempts = 0;
+      
+      while (parent && attempts < 3) {
+        const text = parent.textContent || parent.innerText || '';
+        
+        // Look for patterns like "5" or "5 replies" or "Reply 5"
+        const patterns = [
+          /(\d+)\s*repl/i,  // "5 replies"
+          /repl[^\d]*(\d+)/i,  // "Reply 5"
+          /^(\d+)$/  // Just a number
+        ];
+        
+        for (const pattern of patterns) {
+          const match = text.match(pattern);
+          if (match) {
+            const num = parseInt(match[1], 10);
+            if (num >= 1 && num < 20) {
+              return num;
+            }
+            if (num >= 20 || num === 0) {
+              return null; // Skip if 0 or >= 20
+            }
+          }
+        }
+        
+        // Check for spans or divs with numbers near the button
+        const siblings = Array.from(parent.children || []);
+        for (const sibling of siblings) {
+          if (sibling === replyButton) continue;
+          const siblingText = sibling.textContent || sibling.innerText || '';
+          const numMatch = siblingText.match(/^(\d+)$/);
+          if (numMatch) {
+            const num = parseInt(numMatch[1], 10);
+            if (num >= 1 && num < 20) {
+              return num;
+            }
+            if (num >= 20 || num === 0) {
+              return null;
+            }
+          }
+        }
+        
+        parent = parent.parentElement;
+        attempts++;
+      }
+      
+      // If no number found and button exists, likely 0 comments (skip)
+      return null;
+    });
+    
+    return commentCount;
+  } catch (error) {
+    console.error('  ⚠️  Error getting comment count:', error.message);
+    return null;
+  }
+}
+
 async function extractPostText(page, tweetElement) {
   try {
     const text = await tweetElement.evaluate(el => {
@@ -682,6 +849,18 @@ async function generateAIComment(postText) {
 
 async function commentOnPost(page, tweetElement) {
   try {
+    // First check comment count - only proceed if less than 20
+    const commentCount = await getCommentCount(tweetElement);
+    
+    if (commentCount === null || commentCount === 0 || commentCount >= 20) {
+      return { 
+        success: false, 
+        error: `Comment count is ${commentCount === null ? 'unknown' : commentCount}, skipping (only commenting on posts with less than 20 comments)` 
+      };
+    }
+    
+    console.log(`   ✅ Post has ${commentCount} comment(s) - proceeding to comment`);
+    
     // Find the reply/comment button
     const replyButton = await tweetElement.$('button[data-testid="reply"]');
     
@@ -848,6 +1027,8 @@ async function commentOnPost(page, tweetElement) {
 
 async function commentOnRandomPost(page) {
   try {
+    console.log('   🔍 Looking for posts with less than 20 comments...');
+    
     // Get all visible tweets
     const tweets = await page.$$('[data-testid="tweet"]');
     
@@ -855,10 +1036,19 @@ async function commentOnRandomPost(page) {
       return { success: false, error: 'No tweets found' };
     }
     
-    // Filter to only tweets with visible reply buttons
+    console.log(`   📊 Found ${tweets.length} tweets, checking comment counts...`);
+    
+    // Filter to only tweets with less than 20 comments and visible reply buttons
     const commentableTweets = [];
     for (const tweet of tweets) {
       try {
+        // First check comment count
+        const commentCount = await getCommentCount(tweet);
+        if (commentCount === null || commentCount === 0 || commentCount >= 20) {
+          continue; // Skip posts with 0 or >= 20 comments
+        }
+        
+        // Then check if reply button is visible
         const replyButton = await tweet.$('button[data-testid="reply"]');
         if (replyButton) {
           const isVisible = await replyButton.evaluate(el => {
@@ -868,7 +1058,8 @@ async function commentOnRandomPost(page) {
                    rect.right <= window.innerWidth;
           });
           if (isVisible) {
-            commentableTweets.push(tweet);
+            commentableTweets.push({ tweet, commentCount });
+            console.log(`   ✅ Found eligible post with ${commentCount} comment(s)`);
           }
         }
       } catch (e) {
@@ -877,15 +1068,20 @@ async function commentOnRandomPost(page) {
     }
     
     if (commentableTweets.length === 0) {
-      return { success: false, error: 'No commentable tweets found' };
+      console.log('   ⚠️  No posts found with less than 20 comments');
+      return { success: false, error: 'No eligible posts found (need less than 20 comments)' };
     }
+    
+    console.log(`   ✅ Found ${commentableTweets.length} eligible post(s) with less than 20 comments`);
     
     // Randomly select one tweet
     const randomIndex = Math.floor(Math.random() * commentableTweets.length);
-    const selectedTweet = commentableTweets[randomIndex];
+    const selected = commentableTweets[randomIndex];
+    
+    console.log(`   🎲 Selected post with ${selected.commentCount} comment(s)`);
     
     // Comment on the selected tweet
-    return await commentOnPost(page, selectedTweet);
+    return await commentOnPost(page, selected.tweet);
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1303,6 +1499,90 @@ async function likeRandomPosts(page, likePercentage = 20) {
 }
 
 // ==================== TWITTER LOGIN ====================
+async function isLoggedIn(page) {
+  try {
+    const currentUrl = page.url();
+    
+    // First check: if we're on a login/flow page, definitely not logged in
+    if (currentUrl.includes('/login') || currentUrl.includes('/i/flow')) {
+      return false;
+    }
+    
+    // Second check: look for logged-in indicators on the page
+    try {
+      const hasLoggedInElements = await page.evaluate(() => {
+        // Check for multiple indicators that suggest we're logged in
+        const indicators = [
+          document.querySelector('[data-testid="SideNav_NewTweet_Button"]'),
+          document.querySelector('a[aria-label="Home"]'),
+          document.querySelector('[data-testid="AppTabBar_Home_Link"]'),
+          document.querySelector('nav[role="navigation"]'),
+          document.querySelector('[data-testid="primaryColumn"]'),
+          document.querySelector('a[href="/home"]'),
+          document.querySelector('[aria-label*="Home"]')
+        ];
+        
+        // Return true if at least one indicator is found
+        return indicators.some(el => el !== null);
+      });
+      
+      if (hasLoggedInElements) {
+        return true;
+      }
+    } catch (evalError) {
+      // If evaluation fails, continue with URL check
+      console.log('   ⚠️  Could not evaluate page elements, using URL check only');
+    }
+    
+    // Third check: if we're on known logged-in pages, assume logged in
+    if (currentUrl.includes('/home') || 
+        currentUrl.includes('/compose/tweet') ||
+        currentUrl.includes('/notifications') ||
+        currentUrl.includes('/messages') ||
+        currentUrl.includes('/explore') ||
+        currentUrl.includes('/settings')) {
+      return true;
+    }
+    
+    // If none of the checks passed, assume not logged in
+    return false;
+  } catch (error) {
+    console.error('   ⚠️  Error checking login status:', error.message);
+    return false;
+  }
+}
+
+async function waitForManualLogin(page, maxWaitTime = 300000) {
+  console.log('\n⏳ Waiting for manual login...');
+  console.log('   💡 Please login manually in the browser');
+  console.log(`   ⏱️  Will check every 5 seconds for up to ${maxWaitTime / 1000} seconds`);
+  
+  const startTime = Date.now();
+  const checkInterval = 5000; // Check every 5 seconds
+  
+  while (Date.now() - startTime < maxWaitTime) {
+    await sleep(checkInterval);
+    
+    try {
+      const loggedIn = await isLoggedIn(page);
+      if (loggedIn) {
+        console.log('✅ Manual login detected!');
+        return true;
+      }
+    } catch (error) {
+      // Continue checking
+    }
+    
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    if (elapsed % 30 === 0) {
+      console.log(`   ⏳ Still waiting... (${elapsed}s elapsed)`);
+    }
+  }
+  
+  console.log('⚠️  Timeout waiting for manual login');
+  return false;
+}
+
 async function loginToTwitter(page) {
   try {
     console.log('🔄 Starting Twitter login process...');
@@ -1314,16 +1594,41 @@ async function loginToTwitter(page) {
 
     await sleep(3000);
 
-    console.log('   📝 Entering email...');
-    await page.waitForSelector('input[autocomplete="username"]', { 
-      visible: true,
-      timeout: 15000 
-    });
+    // Try multiple selectors for username/email field
+    const usernameSelectors = [
+      'input[autocomplete="username"]',
+      'input[name="text"]',
+      'input[type="text"]',
+      'input[data-testid="ocfEnterTextTextInput"]'
+    ];
     
-    await page.click('input[autocomplete="username"]');
+    let usernameField = null;
+    for (const selector of usernameSelectors) {
+      try {
+        usernameField = await page.waitForSelector(selector, { 
+          visible: true,
+          timeout: 5000 
+        });
+        if (usernameField) break;
+      } catch (e) {
+        continue;
+      }
+    }
+    
+    if (!usernameField) {
+      console.log('   ⚠️  Could not find username field, checking if already logged in...');
+      if (await isLoggedIn(page)) {
+        console.log('✅ Already logged in!');
+        return true;
+      }
+      throw new Error('Username field not found');
+    }
+
+    console.log('   📝 Entering email...');
+    await usernameField.click();
     await sleep(500);
     
-    await page.type('input[autocomplete="username"]', CONFIG.twitter.email, { 
+    await usernameField.type(CONFIG.twitter.email, { 
       delay: 100 
     });
     
@@ -1333,46 +1638,91 @@ async function loginToTwitter(page) {
     
     await sleep(4000);
 
+    // Check for verification step
     try {
       const pageText = await page.evaluate(() => document.body.innerText);
       
       if (pageText.includes('Enter your phone number') || 
           pageText.includes('unusual login activity') ||
-          pageText.includes('Verify your identity')) {
-        console.log('   ⚠️  Suspicious activity detected...');
+          pageText.includes('Verify your identity') ||
+          pageText.includes('phone number or username')) {
+        console.log('   ⚠️  Verification step detected...');
         
-        await page.waitForSelector('input[autocomplete="on"]', { 
+        const verificationSelectors = [
+          'input[autocomplete="on"]',
+          'input[name="text"]',
+          'input[type="text"]',
+          'input[data-testid="ocfEnterTextTextInput"]'
+        ];
+        
+        let verificationField = null;
+        for (const selector of verificationSelectors) {
+          try {
+            verificationField = await page.waitForSelector(selector, { 
+              visible: true,
+              timeout: 5000 
+            });
+            if (verificationField) break;
+          } catch (e) {
+            continue;
+          }
+        }
+        
+        if (verificationField) {
+          await verificationField.click();
+          await sleep(500);
+          
+          await verificationField.type(CONFIG.twitter.username, { 
+            delay: 100 
+          });
+          
+          await sleep(1500);
+          console.log('   ⌨️  Pressing Enter...');
+          await page.keyboard.press('Enter');
+          
+          await sleep(4000);
+        }
+      }
+    } catch (error) {
+      console.log('   ℹ️  No verification needed or verification field not found');
+    }
+
+    // Try multiple selectors for password field
+    const passwordSelectors = [
+      'input[autocomplete="current-password"]',
+      'input[name="password"]',
+      'input[type="password"]',
+      'input[data-testid="ocfEnterTextTextInput"]'
+    ];
+    
+    console.log('   🔐 Looking for password field...');
+    let passwordField = null;
+    for (const selector of passwordSelectors) {
+      try {
+        passwordField = await page.waitForSelector(selector, { 
           visible: true,
           timeout: 5000 
         });
-        
-        await page.click('input[autocomplete="on"]');
-        await sleep(500);
-        
-        await page.type('input[autocomplete="on"]', CONFIG.twitter.username, { 
-          delay: 100 
-        });
-        
-        await sleep(1500);
-        console.log('   ⌨️  Pressing Enter...');
-        await page.keyboard.press('Enter');
-        
-        await sleep(4000);
+        if (passwordField) {
+          console.log(`   ✅ Found password field with selector: ${selector}`);
+          break;
+        }
+      } catch (e) {
+        continue;
       }
-    } catch (error) {
-      console.log('   ℹ️  No verification needed');
     }
-
-    console.log('   🔐 Entering password...');
-    await page.waitForSelector('input[autocomplete="current-password"]', { 
-      visible: true,
-      timeout: 15000 
-    });
     
-    await page.click('input[autocomplete="current-password"]');
+    if (!passwordField) {
+      console.log('   ⚠️  Could not find password field automatically');
+      console.log('   💡 This might be a different login flow');
+      console.log('   💡 You can login manually and the session will be saved');
+      return false;
+    }
+    
+    await passwordField.click();
     await sleep(500);
     
-    await page.type('input[autocomplete="current-password"]', CONFIG.twitter.password, { 
+    await passwordField.type(CONFIG.twitter.password, { 
       delay: 100 
     });
     
@@ -1382,17 +1732,26 @@ async function loginToTwitter(page) {
     
     await sleep(6000);
     
-    const currentUrl = page.url();
-    if (currentUrl.includes('/home') || !currentUrl.includes('/login')) {
+    // Check if login was successful
+    if (await isLoggedIn(page)) {
       console.log('✅ Successfully logged into Twitter');
       return true;
     } else {
-      console.log('⚠️  Login verification failed');
+      console.log('⚠️  Login verification failed - URL check');
       return false;
     }
 
   } catch (error) {
     console.error('❌ Login failed:', error.message);
+    // Check if user might have logged in manually
+    try {
+      if (await isLoggedIn(page)) {
+        console.log('✅ Detected login (possibly manual)');
+        return true;
+      }
+    } catch (e) {
+      // Ignore
+    }
     return false;
   }
 }
@@ -1421,18 +1780,17 @@ async function automateTwitter() {
       console.log('✅ Continuing without proxy');
     } else {
       // Test HTTPS tunneling (required for Twitter)
+      // Note: Even if this test fails, we'll still try with browser since proxy-chain handles it differently
       console.log('\n🔄 Testing HTTPS tunneling (required for Twitter)...');
       const httpsWorks = await testProxyHTTSTunnel();
       if (!httpsWorks) {
-        console.log('\n⚠️  Proxy does not support HTTPS tunneling!');
-        console.log('   Twitter requires HTTPS, so this proxy will not work.');
-        console.log('   Automatically continuing without proxy in 5 seconds...\n');
-        await sleep(5000);
-        useProxy = false;
-        console.log('✅ Continuing without proxy');
+        console.log('\n⚠️  HTTPS test failed, but will still try with browser...');
+        console.log('   proxy-chain may handle HTTPS differently than axios test\n');
+        // Don't disable proxy - let browser try it
       } else {
-        await rotateProxyIP();
+        console.log('✅ HTTPS tunneling test passed\n');
       }
+      await rotateProxyIP();
     }
   }
 
@@ -1489,20 +1847,38 @@ async function automateTwitter() {
             const loginSuccess = await loginToTwitter(page);
             
             if (!loginSuccess) {
-              throw new Error('Login failed');
+              console.log('\n⚠️  Automated login failed, waiting for manual login...');
+              const manualLoginSuccess = await waitForManualLogin(page, 300000);
+              if (!manualLoginSuccess && !(await isLoggedIn(page))) {
+                throw new Error('Login failed');
+              }
             }
             
-            await extractAndSaveSession(page, CONFIG.twitter.email);
+            // Verify login before saving
+            if (await isLoggedIn(page)) {
+              await extractAndSaveSession(page, CONFIG.twitter.email);
+            } else {
+              throw new Error('Login verification failed');
+            }
           }
         } else {
           console.log('\n🔄 Could not apply cookies, performing fresh login...');
           const loginSuccess = await loginToTwitter(page);
           
           if (!loginSuccess) {
-            throw new Error('Login failed');
+            console.log('\n⚠️  Automated login failed, waiting for manual login...');
+            const manualLoginSuccess = await waitForManualLogin(page, 300000);
+            if (!manualLoginSuccess && !(await isLoggedIn(page))) {
+              throw new Error('Login failed');
+            }
           }
           
-          await extractAndSaveSession(page, CONFIG.twitter.email);
+          // Verify login before saving
+          if (await isLoggedIn(page)) {
+            await extractAndSaveSession(page, CONFIG.twitter.email);
+          } else {
+            throw new Error('Login verification failed');
+          }
         }
       } catch (tunnelError) {
         if (tunnelError.message === 'PROXY_TUNNEL_FAILED' && useProxy) {
@@ -1554,10 +1930,31 @@ async function automateTwitter() {
         const loginSuccess = await loginToTwitter(page);
         
         if (!loginSuccess) {
-          throw new Error('Login failed');
+          console.log('\n⚠️  Automated login failed');
+          console.log('💡 Waiting for manual login...');
+          console.log('   The browser will remain open for you to login manually');
+          console.log('   The session will be automatically saved once login is detected\n');
+          
+          // Wait for manual login
+          const manualLoginSuccess = await waitForManualLogin(page, 300000); // 5 minutes
+          
+          if (!manualLoginSuccess) {
+            // Check one more time if user logged in
+            if (await isLoggedIn(page)) {
+              console.log('✅ Login detected on final check');
+            } else {
+              throw new Error('Login failed - please login manually and restart the script');
+            }
+          }
         }
         
-        await extractAndSaveSession(page, CONFIG.twitter.email);
+        // Verify login before saving session
+        if (await isLoggedIn(page)) {
+          console.log('\n✅ Login confirmed, saving session...');
+          await extractAndSaveSession(page, CONFIG.twitter.email);
+        } else {
+          throw new Error('Login verification failed');
+        }
       } catch (tunnelError) {
         if (tunnelError.message === 'PROXY_TUNNEL_FAILED' && useProxy) {
           console.error('\n❌ Proxy tunnel failed during login');
@@ -1583,9 +1980,19 @@ async function automateTwitter() {
           // Retry login
           const loginSuccess = await loginToTwitter(page);
           if (!loginSuccess) {
-            throw new Error('Login failed');
+            console.log('\n⚠️  Automated login failed, waiting for manual login...');
+            const manualLoginSuccess = await waitForManualLogin(page, 300000);
+            if (!manualLoginSuccess && !(await isLoggedIn(page))) {
+              throw new Error('Login failed');
+            }
           }
-          await extractAndSaveSession(page, CONFIG.twitter.email);
+          
+          // Verify and save session
+          if (await isLoggedIn(page)) {
+            await extractAndSaveSession(page, CONFIG.twitter.email);
+          } else {
+            throw new Error('Login verification failed');
+          }
         } else {
           throw tunnelError;
         }
@@ -1754,6 +2161,29 @@ async function automateTwitter() {
     console.error(error.stack);
     console.log('\n⚠️  Error occurred, but browser will remain open...');
     console.log('   💡 You can still interact with the browser manually');
+    
+    // Check if user is logged in despite the error, and save session if so
+    try {
+      if (await isLoggedIn(page)) {
+        console.log('\n✅ Detected login status - saving session...');
+        await extractAndSaveSession(page, CONFIG.twitter.email);
+        console.log('✅ Session saved successfully!');
+      } else {
+        console.log('\n💡 If you login manually, the session will be saved automatically');
+        console.log('   Waiting 30 seconds to check for manual login...');
+        
+        // Wait a bit and check again
+        await sleep(30000);
+        if (await isLoggedIn(page)) {
+          console.log('✅ Manual login detected - saving session...');
+          await extractAndSaveSession(page, CONFIG.twitter.email);
+          console.log('✅ Session saved successfully!');
+        }
+      }
+    } catch (saveError) {
+      console.log('⚠️  Could not save session:', saveError.message);
+    }
+    
     console.log('   💡 Press Ctrl+C to exit the script');
     
     // Close MongoDB connection before keeping script alive

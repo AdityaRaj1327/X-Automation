@@ -39,29 +39,6 @@ const sessionSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now }
 });
 
-const contentLogSchema = new mongoose.Schema({
-  trendingTopic: String,
-  trendContext: String,
-  tweetCount: String,
-  generatedPost: String,
-  postedAt: { type: Date, default: Date.now },
-  postLength: Number,
-  success: Boolean,
-  retryCount: Number,
-  engagement: {
-    likes: { type: Number, default: 0 },
-    retweets: { type: Number, default: 0 },
-    replies: { type: Number, default: 0 },
-    views: { type: Number, default: 0 }
-  },
-  metadata: {
-    model: String,
-    temperature: Number,
-    scrollPages: Number,
-    method: String
-  }
-});
-
 const accountSchema = new mongoose.Schema({
   email: { type: String, required: true },
   password: { type: String, required: true },
@@ -69,7 +46,6 @@ const accountSchema = new mongoose.Schema({
 });
 
 const Session = mongoose.models.Session || mongoose.model('Session', sessionSchema);
-const ContentLog = mongoose.models.ContentLog || mongoose.model('ContentLog', contentLogSchema);
 const Account = mongoose.models.Account || mongoose.model('Account', accountSchema);
 
 // ==================== CSV FILE PATHS ====================
@@ -538,19 +514,12 @@ app.get('/api/stats', async (req, res) => {
     let totalComments = 0;
     let activeSessions = 0;
     
-    // Get posts from MongoDB
-    if (mongoose.connection.readyState === 1) {
-      try {
-        totalPosts = await ContentLog.countDocuments({ success: true });
-      } catch (err) {
-        console.error('Error getting posts from MongoDB:', err);
-        const postsData = parseCSV(CSV_PATHS.twitterPosts);
-        totalPosts = postsData.filter(row => row.Success === 'Yes').length;
-      }
-    } else {
-      // Fallback: count from CSV
+    // Get posts from CSV only (no MongoDB)
+    if (CSV_PATHS.twitterPosts) {
       const postsData = parseCSV(CSV_PATHS.twitterPosts);
-      totalPosts = postsData.filter(row => row.Success === 'Yes').length;
+      totalPosts = postsData.filter(row => 
+        (row.Success === 'Yes' || row.success === 'Yes' || row.success === true)
+      ).length;
     }
     
     // Get activity data from CSV
@@ -653,15 +622,7 @@ app.get('/api/activity', async (req, res) => {
       ).length;
     } else {
       console.log('⚠️  Twitter posts CSV not found');
-      // Try MongoDB as fallback
-      if (mongoose.connection.readyState === 1) {
-        try {
-          stats.totalPosts = await ContentLog.countDocuments({ success: true });
-          console.log(`✅ Found ${stats.totalPosts} posts in MongoDB`);
-        } catch (err) {
-          console.log('⚠️  Could not read posts from MongoDB:', err.message);
-        }
-      }
+      // No MongoDB fallback - only CSV is used
     }
     
     res.json({ 

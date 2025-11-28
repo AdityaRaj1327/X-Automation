@@ -4,6 +4,7 @@ const puppeteer = require('puppeteer');
 const mongoose = require('mongoose');
 const axios = require('axios');
 const stringSimilarity = require('string-similarity');
+const proxyChain = require('proxy-chain');
 const fs = require('fs');
 const path = require('path');
 const { setTimeout: sleep } = require('timers/promises');
@@ -22,6 +23,14 @@ const CONFIG = {
     apiKey: process.env.OPENROUTER_API_KEY,
     apiUrl: 'https://openrouter.ai/api/v1/chat/completions',
     model: process.env.AI_MODEL || 'openai/gpt-3.5-turbo'
+  },
+  proxy: {
+    host: process.env.PROXY_HOST || '195.201.248.211',
+    port: process.env.PROXY_PORT || '12765',
+    username: process.env.PROXY_USERNAME || 'digitalguruseven',
+    password: process.env.PROXY_PASSWORD || 'dERmacYAstAR',
+    rotateUrl: process.env.PROXY_ROTATE_URL || 'https://gridpanel.net/api/reboot?token=NDU5NjQsNDc1ZDZkYjUtNWUxMi00OTVjLWIzMzctY2NjMTYyNmNiNjFj',
+    enabled: process.env.USE_PROXY !== 'false' // Default to true unless explicitly set to 'false'
   },
   automation: {
     scrollPages: parseInt(process.env.SCROLL_PAGES) || 10,
@@ -133,14 +142,26 @@ function readCSVStats(csvPath) {
     const content = fs.readFileSync(csvPath, 'utf8');
     const lines = content.split('\n').filter(line => line.trim());
     
-    if (lines.length <= 1) return { totalPosts: 0, successfulPosts: 0, failedPosts: 0 };
+    if (lines.length <= 1) return { totalPosts: 0, successfulPosts: 0, failedPosts: 0, allPosts: [] };
     
+    const headers = lines[0].split(',').map(h => h.trim());
     const dataLines = lines.slice(1); // Skip header
+    
+    // Parse CSV rows into objects
+    const allPosts = dataLines.map(line => {
+      const values = line.split(',').map(v => v.trim());
+      const post = {};
+      headers.forEach((header, index) => {
+        post[header] = values[index] || '';
+      });
+      return post;
+    });
+    
     const totalPosts = dataLines.length;
     const successfulPosts = dataLines.filter(line => line.includes(',Yes,')).length;
     const failedPosts = totalPosts - successfulPosts;
     
-    return { totalPosts, successfulPosts, failedPosts };
+    return { totalPosts, successfulPosts, failedPosts, allPosts };
   } catch (error) {
     console.error('❌ Error reading CSV stats:', error.message);
     return null;
@@ -157,40 +178,7 @@ const sessionSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now }
 });
 
-const contentLogSchema = new mongoose.Schema({
-  trendingTopic: String,
-  trendContext: String,
-  tweetCount: String,
-  generatedPost: String,
-  postedAt: { type: Date, default: Date.now },
-  postLength: Number,
-  success: Boolean,
-  retryCount: Number,
-  engagement: {
-    likes: { type: Number, default: 0 },
-    retweets: { type: Number, default: 0 },
-    replies: { type: Number, default: 0 },
-    views: { type: Number, default: 0 }
-  },
-  metadata: {
-    model: String,
-    temperature: Number,
-    scrollPages: Number,
-    method: String
-  }
-});
-
-const errorLogSchema = new mongoose.Schema({
-  errorType: String,
-  errorMessage: String,
-  stackTrace: String,
-  context: Object,
-  timestamp: { type: Date, default: Date.now }
-});
-
 const Session = mongoose.model('Session', sessionSchema);
-const ContentLog = mongoose.model('ContentLog', contentLogSchema);
-const ErrorLog = mongoose.model('ErrorLog', errorLogSchema);
 
 // ==================== DATABASE FUNCTIONS ====================
 async function connectMongoDB() {
@@ -240,20 +228,7 @@ async function saveSessionToDB(email, cookies, localStorage, sessionStorage) {
 
 async function logSuccessfulPost(trendingTopic, trendContext, tweetCount, postContent, retryCount, metadata, csvPath) {
   try {
-    // Save to MongoDB
-    await ContentLog.create({
-      trendingTopic,
-      trendContext,
-      tweetCount,
-      generatedPost: postContent,
-      postLength: postContent.length,
-      success: true,
-      retryCount,
-      metadata
-    });
-    console.log('✅ Post logged to MongoDB');
-    
-    // Save to CSV
+    // Save to CSV only
     const csvData = {
       trendingTopic,
       trendContext,
@@ -268,6 +243,7 @@ async function logSuccessfulPost(trendingTopic, trendContext, tweetCount, postCo
     };
     
     appendToCSV(csvPath, csvData);
+    console.log('✅ Post logged to CSV');
     
   } catch (error) {
     console.error('❌ Error logging post:', error.message);
@@ -276,25 +252,7 @@ async function logSuccessfulPost(trendingTopic, trendContext, tweetCount, postCo
 
 async function logFailedPost(trendingTopic, trendContext, tweetCount, postContent, error, csvPath) {
   try {
-    // Save to MongoDB
-    await ContentLog.create({
-      trendingTopic,
-      trendContext,
-      tweetCount,
-      generatedPost: postContent,
-      postLength: postContent.length,
-      success: false,
-      retryCount: CONFIG.automation.maxRetries
-    });
-    
-    await ErrorLog.create({
-      errorType: 'POST_FAILED',
-      errorMessage: error.message,
-      stackTrace: error.stack,
-      context: { trendingTopic, postContent }
-    });
-    
-    // Save to CSV
+    // Save to CSV only
     const csvData = {
       trendingTopic,
       trendContext,
@@ -309,30 +267,49 @@ async function logFailedPost(trendingTopic, trendContext, tweetCount, postConten
     };
     
     appendToCSV(csvPath, csvData);
+    console.log('✅ Failed post logged to CSV');
     
   } catch (err) {
     console.error('❌ Error logging failure:', err.message);
   }
 }
 
-async function checkContentDiversity(newPost) {
+async function checkContentDiversity(newPost, csvPath) {
   try {
-    const recentPosts = await ContentLog.find({
-      postedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
-      success: true
-    }).limit(20);
+    // Read from CSV instead of MongoDB
+    const csvData = readCSVStats(csvPath);
+    if (!csvData || !csvData.allPosts || csvData.allPosts.length === 0) {
+      return true; // No previous posts to compare
+    }
+    
+    // Get recent successful posts from last 24 hours
+    const now = Date.now();
+    const oneDayAgo = now - (24 * 60 * 60 * 1000);
+    
+    const recentPosts = csvData.allPosts
+      .filter(post => {
+        if (post.Success !== 'Yes' && post.success !== 'Yes' && post.success !== true) {
+          return false; // Only successful posts
+        }
+        const postTime = new Date(post.Timestamp || post.timestamp || 0).getTime();
+        return postTime >= oneDayAgo;
+      })
+      .slice(0, 20); // Limit to 20 most recent
     
     if (recentPosts.length === 0) return true;
     
     for (const post of recentPosts) {
+      const postContent = post['Post Content'] || post.post_content || '';
+      if (!postContent) continue;
+      
       const similarity = stringSimilarity.compareTwoStrings(
-        post.generatedPost.toLowerCase(),
+        postContent.toLowerCase(),
         newPost.toLowerCase()
       );
       
       if (similarity > CONFIG.automation.similarityThreshold) {
         console.log(`⚠️  Post too similar to recent post (${(similarity * 100).toFixed(1)}% match)`);
-        console.log(`   Recent: "${post.generatedPost.substring(0, 50)}..."`);
+        console.log(`   Recent: "${postContent.substring(0, 50)}..."`);
         return false;
       }
     }
@@ -341,7 +318,7 @@ async function checkContentDiversity(newPost) {
     return true;
   } catch (error) {
     console.error('❌ Error checking diversity:', error.message);
-    return true;
+    return true; // Allow post if check fails
   }
 }
 
@@ -397,6 +374,249 @@ function selectRandomTrend(trends, usedTopics = []) {
   
   console.log(`  🎲 Randomly selected trend ${randomIndex + 1} from ${availableTrends.length} available`);
   return selectedTrend;
+}
+
+// ==================== PROXY FUNCTIONS ====================
+async function testProxyConnection() {
+  try {
+    console.log('🔄 Testing proxy connection...');
+    console.log(`   Proxy: ${CONFIG.proxy.host}:${CONFIG.proxy.port}`);
+    
+    const proxyConfig = {
+      protocol: 'http',
+      host: CONFIG.proxy.host,
+      port: parseInt(CONFIG.proxy.port),
+      auth: {
+        username: CONFIG.proxy.username,
+        password: CONFIG.proxy.password
+      }
+    };
+    
+    // Try HTTPS first (most common)
+    try {
+      const response = await axios.get('https://api.ipify.org?format=json', {
+        proxy: proxyConfig,
+        timeout: 15000,
+        validateStatus: (status) => status === 200
+      });
+      
+      if (response.data && response.data.ip) {
+        console.log('✅ Proxy is working');
+        console.log(`   Your IP through proxy: ${response.data.ip}`);
+        return true;
+      }
+    } catch (httpsError) {
+      // If HTTPS fails, try HTTP (some proxies don't support HTTPS)
+      try {
+        console.log('   ⚠️  HTTPS test failed, trying HTTP...');
+        const response = await axios.get('http://api.ipify.org?format=json', {
+          proxy: proxyConfig,
+          timeout: 15000
+        });
+        
+        if (response.data && response.data.ip) {
+          console.log('✅ Proxy is working (HTTP only)');
+          console.log(`   Your IP through proxy: ${response.data.ip}`);
+          console.log('   ⚠️  Note: Proxy may not support HTTPS - browser may still work');
+          return true;
+        }
+      } catch (httpError) {
+        throw httpsError;
+      }
+    }
+    
+    throw new Error('Proxy test completed but no valid response received');
+  } catch (error) {
+    console.error('❌ Proxy connection test failed:', error.message);
+    return false;
+  }
+}
+
+async function rotateProxyIP() {
+  try {
+    if (!CONFIG.proxy.rotateUrl) {
+      console.log('⚠️  No proxy rotation URL configured');
+      return;
+    }
+    
+    console.log('🔄 Rotating proxy IP...');
+    const response = await axios.get(CONFIG.proxy.rotateUrl, {
+      timeout: 10000
+    });
+    
+    if (response.status === 200) {
+      console.log('✅ Proxy IP rotated successfully');
+      await sleep(3000); // Wait for IP to change
+    }
+  } catch (error) {
+    console.error('⚠️  Proxy rotation failed:', error.message);
+  }
+}
+
+async function testProxyHTTSTunnel() {
+  try {
+    console.log('🔄 Testing proxy HTTPS tunneling capability...');
+    const proxyConfig = {
+      protocol: 'http',
+      host: CONFIG.proxy.host,
+      port: parseInt(CONFIG.proxy.port),
+      auth: {
+        username: CONFIG.proxy.username,
+        password: CONFIG.proxy.password
+      }
+    };
+    
+    // Test HTTPS with a simple site first (more reliable than Twitter)
+    // Accept any status code - even 400/403 means the tunnel works
+    try {
+      const response = await axios.get('https://www.google.com', {
+        proxy: proxyConfig,
+        timeout: 10000,
+        maxRedirects: 3,
+        validateStatus: () => true // Accept any status code
+      });
+      
+      // If we got a response (even error), HTTPS tunneling works
+      console.log('✅ Proxy supports HTTPS tunneling');
+      return true;
+    } catch (testError) {
+      // Check if it's a connection error (tunnel doesn't work) vs HTTP error (tunnel works)
+      if (testError.code === 'ECONNREFUSED' || 
+          testError.code === 'ECONNRESET' || 
+          testError.code === 'ETIMEDOUT' ||
+          testError.message.includes('tunnel') ||
+          testError.message.includes('ENOTFOUND')) {
+        // Real connection error - tunnel doesn't work
+        throw testError;
+      }
+      
+      // HTTP errors (400, 403, etc.) mean the tunnel works, just the site rejected us
+      console.log('✅ Proxy supports HTTPS tunneling (got response, even if error)');
+      return true;
+    }
+  } catch (error) {
+    // Only log as failure if it's a real connection error
+    if (error.code === 'ECONNRESET' || 
+        error.code === 'ECONNREFUSED' || 
+        error.code === 'ETIMEDOUT' ||
+        error.message.includes('tunnel') ||
+        error.message.includes('ENOTFOUND')) {
+      console.error('❌ Proxy does not support HTTPS tunneling:', error.message);
+      console.log('   💡 This proxy may not support HTTPS/SSL tunneling');
+      return false;
+    }
+    
+    // Other errors might still mean tunnel works, so allow it
+    console.log('⚠️  HTTPS test inconclusive, but will try with browser anyway');
+    return true;
+  }
+}
+
+async function launchBrowserWithProxy() {
+  let newProxyUrl = null;
+  try {
+    const oldProxyUrl = `http://${CONFIG.proxy.username}:${CONFIG.proxy.password}@${CONFIG.proxy.host}:${CONFIG.proxy.port}`;
+    
+    console.log('🔄 Setting up proxy chain...');
+    newProxyUrl = await proxyChain.anonymizeProxy(oldProxyUrl);
+    console.log('✅ Proxy chain created');
+    console.log(`   Local proxy: ${newProxyUrl}`);
+    
+    const browser = await puppeteer.launch({
+      headless: false,
+      args: [
+        `--proxy-server=${newProxyUrl}`,
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-blink-features=AutomationControlled',
+        '--ignore-certificate-errors',
+        '--ignore-certificate-errors-spki-list',
+        '--window-size=1920,1080',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu'
+      ],
+      ignoreDefaultArgs: ['--enable-automation']
+    });
+
+    const pages = await browser.pages();
+    const page = pages.length > 0 ? pages[0] : await browser.newPage();
+    
+    // Set up error handling for tunnel failures
+    page.on('error', (error) => {
+      if (error.message.includes('ERR_TUNNEL_CONNECTION_FAILED')) {
+        console.error('⚠️  Tunnel connection error detected');
+      }
+    });
+    
+    await page.setViewport({ width: 1920, height: 1080 });
+    
+    const userAgents = [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+    ];
+    
+    const randomUA = userAgents[Math.floor(Math.random() * userAgents.length)];
+    await page.setUserAgent(randomUA);
+
+    // Test if proxy actually works by trying to load a simple HTTPS page
+    try {
+      await page.goto('https://api.ipify.org?format=json', {
+        waitUntil: 'networkidle2',
+        timeout: 15000
+      });
+      const ipData = await page.evaluate(() => document.body.textContent);
+      const ipInfo = JSON.parse(ipData);
+      if (ipInfo && ipInfo.ip) {
+        console.log(`✅ Proxy verified - Your IP: ${ipInfo.ip}`);
+      }
+    } catch (ipError) {
+      console.log('⚠️  Could not verify proxy IP, but continuing...');
+    }
+
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined
+      });
+      
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5]
+      });
+      
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en']
+      });
+      
+      window.chrome = {
+        runtime: {}
+      };
+      
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+    });
+    
+    console.log('✅ Browser launched with proxy and stealth mode');
+    return { browser, page, proxyUrl: newProxyUrl };
+  } catch (error) {
+    console.error('❌ Error launching browser with proxy:', error.message);
+    if (newProxyUrl) {
+      try {
+        await proxyChain.closeAnonymizedProxy(newProxyUrl, true);
+      } catch (closeError) {
+        // Ignore close errors
+      }
+    }
+    throw error;
+  }
 }
 
 // ==================== BROWSER FUNCTIONS ====================
@@ -472,11 +692,48 @@ async function launchBrowser() {
 async function applySessionCookies(page, sessionData) {
   try {
     console.log('🔄 Loading Twitter to set cookies...');
-    await page.goto('https://twitter.com', {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000
-    });
-    await humanDelay(1000, 2000);
+    
+    // Try to navigate, but handle tunnel errors gracefully
+    let navigationSuccess = false;
+    try {
+      await safeNavigate(page, 'https://twitter.com', {
+        waitUntil: 'domcontentloaded',
+        timeout: 20000
+      });
+      navigationSuccess = true;
+      await humanDelay(1000, 2000);
+    } catch (navError) {
+      // Handle tunnel connection errors
+      if (navError.message.includes('ERR_TUNNEL_CONNECTION_FAILED') ||
+          navError.message.includes('tunnel') ||
+          navError.message.includes('net::')) {
+        console.log('   ⚠️  Navigation failed due to tunnel/proxy issue');
+        console.log('   💡 Attempting to apply cookies on current page...');
+        
+        // Check if we're already on a valid page
+        const currentUrl = page.url();
+        if (currentUrl.includes('twitter.com') || currentUrl.includes('x.com')) {
+          console.log('   ✅ Already on Twitter page, proceeding with cookie application');
+          navigationSuccess = true;
+        } else {
+          // Try one more time with a simpler navigation
+          try {
+            await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 5000 });
+            await humanDelay(500);
+            await safeNavigate(page, 'https://twitter.com', {
+              waitUntil: 'domcontentloaded',
+              timeout: 15000
+            });
+            navigationSuccess = true;
+          } catch (retryError) {
+            console.log('   ⚠️  Retry navigation also failed, but will still try to apply cookies');
+            // Continue anyway - we'll try to apply cookies
+          }
+        }
+      } else {
+        throw navError; // Re-throw if it's not a tunnel error
+      }
+    }
     
     const cleanCookies = sessionData.cookies
       .filter(cookie => cookie.name && cookie.value && cookie.domain)
@@ -492,22 +749,101 @@ async function applySessionCookies(page, sessionData) {
       }));
     
     if (cleanCookies.length > 0) {
-      await page.setCookie(...cleanCookies);
-      console.log('✅ Session cookies applied');
-      console.log(`  Cookies loaded: ${cleanCookies.length}`);
+      try {
+        await page.setCookie(...cleanCookies);
+        console.log('✅ Session cookies applied');
+        console.log(`  Cookies loaded: ${cleanCookies.length}`);
+      } catch (cookieError) {
+        // If setting cookies fails, try setting them one by one
+        console.log('   ⚠️  Batch cookie setting failed, trying individually...');
+        let successCount = 0;
+        for (const cookie of cleanCookies) {
+          try {
+            await page.setCookie(cookie);
+            successCount++;
+          } catch (e) {
+            // Skip invalid cookies
+            continue;
+          }
+        }
+        if (successCount > 0) {
+          console.log(`✅ Applied ${successCount}/${cleanCookies.length} cookies`);
+        } else {
+          console.log('   ⚠️  Could not apply any cookies');
+        }
+      }
     }
     
     if (sessionData.localStorage && Object.keys(sessionData.localStorage).length > 0) {
-      await page.evaluate((data) => {
-        for (const [key, value] of Object.entries(data)) {
-          try { localStorage.setItem(key, value); } catch (e) {}
-        }
-      }, sessionData.localStorage);
+      try {
+        await page.evaluate((data) => {
+          for (const [key, value] of Object.entries(data)) {
+            try { localStorage.setItem(key, value); } catch (e) {}
+          }
+        }, sessionData.localStorage);
+        console.log('✅ LocalStorage applied');
+      } catch (lsError) {
+        console.log('   ⚠️  Could not apply localStorage:', lsError.message);
+      }
     }
     
     return true;
   } catch (error) {
     console.error('❌ Error applying cookies:', error.message);
+    // Don't fail completely - cookies might still be applied
+    // Return true to allow the script to continue and validate the session
+    return true;
+  }
+}
+
+async function safeNavigate(page, url, options = {}) {
+  try {
+    const defaultOptions = {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
+    };
+    const finalOptions = { ...defaultOptions, ...options };
+    
+    await page.goto(url, finalOptions);
+    return true;
+  } catch (error) {
+    // Handle navigation errors gracefully
+    if (error.message.includes('ERR_ABORTED') || 
+        error.message.includes('Navigation timeout') ||
+        error.message.includes('net::')) {
+      // Check if we're already on the target page or a valid page
+      const currentUrl = page.url();
+      if (currentUrl.includes(url.replace('https://twitter.com', '')) || 
+          currentUrl.includes('/home') ||
+          (!currentUrl.includes('/login') && !currentUrl.includes('/i/flow'))) {
+        return true; // Already on a valid page
+      }
+    }
+    throw error;
+  }
+}
+
+async function isLoggedIn(page) {
+  try {
+    const currentUrl = page.url();
+    // Check if we're on a logged-in page
+    if (currentUrl.includes('/home') || 
+        currentUrl.includes('/compose/tweet') ||
+        currentUrl.includes('/notifications') ||
+        (!currentUrl.includes('/login') && !currentUrl.includes('/i/flow'))) {
+      // Additional check: look for logged-in indicators
+      const hasLoggedInElements = await page.evaluate(() => {
+        return !!(
+          document.querySelector('[data-testid="SideNav_NewTweet_Button"]') ||
+          document.querySelector('a[aria-label="Home"]') ||
+          document.querySelector('[data-testid="AppTabBar_Home_Link"]') ||
+          document.querySelector('nav[role="navigation"]')
+        );
+      });
+      return hasLoggedInElements;
+    }
+    return false;
+  } catch (error) {
     return false;
   }
 }
@@ -515,17 +851,36 @@ async function applySessionCookies(page, sessionData) {
 async function validateSession(page) {
   try {
     console.log('🔄 Validating session...');
-    await page.goto('https://twitter.com/home', {
-      waitUntil: 'networkidle2',
-      timeout: 30000
-    });
-    await humanDelay(3000, 5000);
     
-    const isLoggedIn = await page.evaluate(() => {
-      return !window.location.href.includes('/login');
-    });
+    // First check current page status without navigating
+    const currentLoggedIn = await isLoggedIn(page);
+    if (currentLoggedIn) {
+      console.log('✅ Session is valid - Already logged in (current page check)');
+      return true;
+    }
     
-    if (isLoggedIn) {
+    // Try to navigate to home page with error handling
+    try {
+      await safeNavigate(page, 'https://twitter.com/home', {
+        waitUntil: 'domcontentloaded',
+        timeout: 20000
+      });
+      await humanDelay(2000, 3000);
+    } catch (navError) {
+      // If navigation fails, check if we're already logged in on current page
+      console.log('   ⚠️  Navigation had issues, checking current page status...');
+      const stillLoggedIn = await isLoggedIn(page);
+      if (stillLoggedIn) {
+        console.log('✅ Session is valid - Already logged in (despite navigation error)');
+        return true;
+      }
+      // If navigation failed and we're not logged in, continue to check
+    }
+    
+    // Check login status after navigation attempt
+    const isLoggedInStatus = await isLoggedIn(page);
+    
+    if (isLoggedInStatus) {
       console.log('✅ Session is valid - Already logged in');
       return true;
     } else {
@@ -533,6 +888,17 @@ async function validateSession(page) {
       return false;
     }
   } catch (error) {
+    // If error occurs, try one more time to check current page
+    try {
+      const fallbackCheck = await isLoggedIn(page);
+      if (fallbackCheck) {
+        console.log('✅ Session is valid - Already logged in (fallback check)');
+        return true;
+      }
+    } catch (e) {
+      // Ignore fallback errors
+    }
+    
     console.error('❌ Session validation failed:', error.message);
     return false;
   }
@@ -693,7 +1059,7 @@ async function getTrendingTopicsWithContext(page) {
     await humanDelay(3000, 5000);
     
     for (let i = 0; i < 3; i++) {
-      await page.evaluate(() => window.scrollBy(0, 500));
+      await page.evaluate(() => window.scrollBy(0, 500));                                                                                                                                                                                                                                                                                                                                   
       await humanDelay(1000, 2000);
     }
     
@@ -1288,16 +1654,16 @@ async function verifyTweetPosted(page, tweetContent) {
     if (textareaCleared) {
       console.log('  ✅ Compose area cleared - tweet posted successfully');
       // Navigate to home immediately after successful post
-      await page.goto('https://twitter.com/home', {
-        waitUntil: 'networkidle2',
+      await safeNavigate(page, 'https://twitter.com/home', {
+        waitUntil: 'domcontentloaded',
         timeout: 30000
       });
       await humanDelay(2000, 3000);
       return true;
     }
     
-    await page.goto('https://twitter.com/home', {
-      waitUntil: 'networkidle2',
+    await safeNavigate(page, 'https://twitter.com/home', {
+      waitUntil: 'domcontentloaded',
       timeout: 30000
     });
     await humanDelay(3000, 5000);
@@ -1334,7 +1700,7 @@ async function postTweetWithButton(page, tweetContent) {
     console.log(`📝 Content: "${tweetContent}"`);
     console.log(`📏 Length: ${tweetContent.length} characters`);
     
-    await page.goto('https://twitter.com/home', {
+    await safeNavigate(page, 'https://twitter.com/home', {
       waitUntil: 'domcontentloaded',
       timeout: 30000
     });
@@ -1565,8 +1931,37 @@ async function main() {
   
   await connectMongoDB();
   
-  let browser, page;
+  let browser, page, proxyUrl = null;
   const usedTopics = [];
+  let useProxy = CONFIG.proxy.enabled;
+  
+  // Test proxy if enabled
+  if (useProxy) {
+    console.log('\n🔐 PROXY CONFIGURATION');
+    console.log('─'.repeat(60));
+    console.log(`   Host: ${CONFIG.proxy.host}:${CONFIG.proxy.port}`);
+    console.log(`   Username: ${CONFIG.proxy.username}`);
+    console.log(`   Rotate URL: ${CONFIG.proxy.rotateUrl ? 'Configured' : 'Not configured'}`);
+    
+    const proxyWorks = await testProxyConnection();
+    if (!proxyWorks) {
+      console.log('\n⚠️  Proxy basic test failed. Continuing without proxy...\n');
+      useProxy = false;
+    } else {
+      // Test HTTPS tunneling (required for Twitter)
+      // Note: Even if this test fails, we'll still try with browser since proxy-chain handles it differently
+      console.log('\n🔄 Testing HTTPS tunneling (required for Twitter)...');
+      const httpsWorks = await testProxyHTTSTunnel();
+      if (!httpsWorks) {
+        console.log('\n⚠️  HTTPS test failed, but will still try with browser...');
+        console.log('   proxy-chain may handle HTTPS differently than axios test\n');
+        // Don't disable proxy - let browser try it
+      } else {
+        console.log('✅ HTTPS tunneling test passed\n');
+      }
+      await rotateProxyIP();
+    }
+  }
   
   try {
     console.log('\n⏰ TIMING CHECK');
@@ -1575,9 +1970,19 @@ async function main() {
     
     console.log('\n📱 STEP 1: BROWSER INITIALIZATION');
     console.log('─'.repeat(60));
-    const result = await launchBrowser();
-    browser = result.browser;
-    page = result.page;
+    let result;
+    if (useProxy) {
+      console.log('🔄 Launching browser with proxy...');
+      result = await launchBrowserWithProxy();
+      browser = result.browser;
+      page = result.page;
+      proxyUrl = result.proxyUrl;
+    } else {
+      console.log('🔄 Launching browser without proxy...');
+      result = await launchBrowser();
+      browser = result.browser;
+      page = result.page;
+    }
     
     console.log('\n🔐 STEP 2: AUTHENTICATION');
     console.log('─'.repeat(60));
@@ -1611,8 +2016,8 @@ async function main() {
     
     console.log('\n📜 STEP 3: SCROLLING FEED');
     console.log('─'.repeat(60));
-    await page.goto('https://twitter.com/home', {
-      waitUntil: 'networkidle2',
+    await safeNavigate(page, 'https://twitter.com/home', {
+      waitUntil: 'domcontentloaded',
       timeout: 30000
     });
     await humanDelay(2000, 3000);
@@ -1679,7 +2084,7 @@ async function main() {
     
     console.log('\n🔍 STEP 8: CONTENT DIVERSITY CHECK');
     console.log('─'.repeat(60));
-    const isDiverse = await checkContentDiversity(postData.post);
+    const isDiverse = await checkContentDiversity(postData.post, csvPath);
     
     if (!isDiverse) {
       console.log('⚠️  Generated post is too similar to recent posts');
@@ -1739,8 +2144,8 @@ async function main() {
         }
         
         // Navigate to home before posting
-        await page.goto('https://twitter.com/home', {
-          waitUntil: 'networkidle2',
+        await safeNavigate(page, 'https://twitter.com/home', {
+          waitUntil: 'domcontentloaded',
           timeout: 30000
         });
         await humanDelay(2000, 3000);
@@ -1753,8 +2158,8 @@ async function main() {
         console.log(`✅ Post ${postNumber} completed successfully!`);
         
         // Navigate to home after successful post
-        await page.goto('https://twitter.com/home', {
-          waitUntil: 'networkidle2',
+        await safeNavigate(page, 'https://twitter.com/home', {
+          waitUntil: 'domcontentloaded',
           timeout: 30000
         });
         await humanDelay(3000, 5000); // Wait before next post
@@ -1777,8 +2182,8 @@ async function main() {
       console.log('  📋 Filter: Only commenting on posts with 1-9 comments');
       
       // Navigate to home to see posts
-      await page.goto('https://twitter.com/home', {
-        waitUntil: 'networkidle2',
+      await safeNavigate(page, 'https://twitter.com/home', {
+        waitUntil: 'domcontentloaded',
         timeout: 30000
       });
       await humanDelay(3000, 5000);
@@ -1815,7 +2220,7 @@ async function main() {
       }
       console.log(`✅ Scrolled ${CONFIG.automation.scrollPages} pages`);
       console.log(`✅ Found ${trendingTopics.length} trending topics`);
-      console.log(`✅ Logged to MongoDB & CSV`);
+      console.log(`✅ Logged to CSV`);
       console.log(`   CSV: ${csvPath}`);
     } else {
       console.log('⚠️  AUTOMATION COMPLETED WITH WARNINGS');
@@ -1833,20 +2238,21 @@ async function main() {
     console.error('Error:', error.message);
     console.error('Stack:', error.stack);
     
-    try {
-      await ErrorLog.create({
-        errorType: 'CRITICAL_AUTOMATION_ERROR',
-        errorMessage: error.message,
-        stackTrace: error.stack,
-        context: { timestamp: new Date() }
-      });
-    } catch (logError) {
-      console.error('Could not log error to database:', logError.message);
-    }
+    // Errors are logged to console only - no MongoDB storage
+    console.error('Error details logged to console');
   } finally {
     if (browser) {
       await browser.close();
       console.log('\n✅ Browser closed');
+    }
+    // Close proxy chain if used
+    if (proxyUrl) {
+      try {
+        await proxyChain.closeAnonymizedProxy(proxyUrl, true);
+        console.log('✅ Proxy chain closed');
+      } catch (closeError) {
+        // Ignore close errors
+      }
     }
     await mongoose.connection.close();
     console.log('✅ MongoDB connection closed');
