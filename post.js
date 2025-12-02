@@ -985,7 +985,7 @@ async function loginToTwitter(page) {
           timeout: 5000
         });
         await page.click('input[autocomplete="on"]');
-        await humanDelay(500, 1000);
+        await humanDelay(500, 1000); 
         
         for (const char of CONFIG.twitter.username) {
           await page.keyboard.type(char, {
